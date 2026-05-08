@@ -17,73 +17,53 @@ API_KEYS = [
     os.environ.get('GEMINI_KEY_6')
 ]
 
-# Model fallback chain - tries each until one works
-MODEL_NAMES = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-pro",
-    "gemini-1.0-pro"
-]
-
 def call_gemini(prompt, api_key):
-    """Raw REST API call to Gemini with model fallback"""
-    for model_name in MODEL_NAMES:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-        payload = {
-            "contents": [{"parts":[{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 8192
-            }
-        }
-        
-        try:
-            response = requests.post(url, json=payload, timeout=60)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'candidates' in data and len(data['candidates']) > 0:
-                    print(f"[+] Successfully used model: {model_name}")
-                    return data['candidates'][0]['content']['parts'][0]['text']
-                else:
-                    print(f"[-] Model {model_name} returned empty candidates. Trying next...")
-                    continue
-            elif response.status_code == 404:
-                print(f"[-] Model {model_name} not available. Trying next...")
-                continue
-            elif response.status_code == 429:
-                print(f"[-] Rate limited on {model_name}. Rotating key...")
-                continue
-            else:
-                print(f"[-] Error {response.status_code} on {model_name}: {response.text[:200]}")
-                continue
-                
-        except requests.exceptions.Timeout:
-            print(f"[-] Timeout on {model_name}. Trying next...")
-            continue
-        except Exception as e:
-            print(f"[-] Exception on {model_name}: {str(e)}")
-            continue
+    """Raw REST API call to Gemini using gemini-flash-latest"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
     
-    # If ALL models failed with this key, try a different key
-    raise Exception(f"All models failed for this API key. Check if your Gemini API keys are valid and have access enabled.")
+    payload = {
+        "contents": [{"parts":[{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 8192
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=90)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'candidates' in data and len(data['candidates']) > 0:
+                print("[+] Successfully used model: gemini-flash-latest")
+                return data['candidates'][0]['content']['parts'][0]['text']
+            else:
+                raise Exception("API returned 200 but no candidates found.")
+        elif response.status_code == 429:
+            raise Exception("Rate limited (429). Need to rotate key.")
+        else:
+            raise Exception(f"API Error {response.status_code}: {response.text[:200]}")
+            
+    except requests.exceptions.Timeout:
+        raise Exception("API request timed out.")
+    except Exception as e:
+        raise Exception(f"Request failed: {str(e)}")
 
 def call_gemini_with_retry(prompt):
     """Try calling Gemini with key rotation on failure"""
     keys = [k for k in API_KEYS if k]
-    random.shuffle(keys)  # Randomize key order
+    random.shuffle(keys)  # Randomize key order so we don't always hit Key 1 first
     
-    errors = []
-    for key in keys:
+    for i, key in enumerate(keys):
         try:
+            print(f"[+] Attempting API Key #{i+1}...")
             return call_gemini(prompt, key)
         except Exception as e:
-            errors.append(str(e))
+            print(f"[-] Key #{i+1} failed: {str(e)}")
             continue
     
     # If ALL keys failed
-    raise Exception(f"All API keys exhausted. Errors: {' | '.join(errors)}")
+    raise Exception("All 6 API keys exhausted or failed. Check your keys and billing.")
 
 def stage_1_recon(target):
     """STAGE 1: Simulate raw recon"""

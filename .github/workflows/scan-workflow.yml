@@ -1,0 +1,46 @@
+name: OMNISCIENCE Scan Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target Domain or IP'
+        required: true
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      callback_url:
+        description: 'GAS Webhook URL'
+        required: true
+
+jobs:
+  scan-and-analyze:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install requests google-generativeai
+
+      - name: Create Cache Directory
+        run: mkdir -p ./cache
+
+      - name: Run Engine (Scan + AI Analysis)
+        env:
+          TARGET: ${{ github.event.inputs.target }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          GEMINI_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
+          GEMINI_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
+          GEMINI_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
+        run: python engine.py

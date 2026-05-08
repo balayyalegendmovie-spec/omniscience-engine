@@ -17,16 +17,73 @@ API_KEYS = [
     os.environ.get('GEMINI_KEY_6')
 ]
 
+# Model fallback chain - tries each until one works
+MODEL_NAMES = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-pro",
+    "gemini-1.0-pro"
+]
+
 def call_gemini(prompt, api_key):
-    """Raw REST API call to Gemini - Bulletproof method"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-    payload = {
-        "contents": [{"parts":[{"text": prompt}]}]
-    }
-    response = requests.post(url, json=payload)
-    response.raise_for_status() # Fail fast if error
-    data = response.json()
-    return data['candidates'][0]['content']['parts'][0]['text']
+    """Raw REST API call to Gemini with model fallback"""
+    for model_name in MODEL_NAMES:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts":[{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 8192
+            }
+        }
+        
+        try:
+            response = requests.post(url, json=payload, timeout=60)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'candidates' in data and len(data['candidates']) > 0:
+                    print(f"[+] Successfully used model: {model_name}")
+                    return data['candidates'][0]['content']['parts'][0]['text']
+                else:
+                    print(f"[-] Model {model_name} returned empty candidates. Trying next...")
+                    continue
+            elif response.status_code == 404:
+                print(f"[-] Model {model_name} not available. Trying next...")
+                continue
+            elif response.status_code == 429:
+                print(f"[-] Rate limited on {model_name}. Rotating key...")
+                continue
+            else:
+                print(f"[-] Error {response.status_code} on {model_name}: {response.text[:200]}")
+                continue
+                
+        except requests.exceptions.Timeout:
+            print(f"[-] Timeout on {model_name}. Trying next...")
+            continue
+        except Exception as e:
+            print(f"[-] Exception on {model_name}: {str(e)}")
+            continue
+    
+    # If ALL models failed with this key, try a different key
+    raise Exception(f"All models failed for this API key. Check if your Gemini API keys are valid and have access enabled.")
+
+def call_gemini_with_retry(prompt):
+    """Try calling Gemini with key rotation on failure"""
+    keys = [k for k in API_KEYS if k]
+    random.shuffle(keys)  # Randomize key order
+    
+    errors = []
+    for key in keys:
+        try:
+            return call_gemini(prompt, key)
+        except Exception as e:
+            errors.append(str(e))
+            continue
+    
+    # If ALL keys failed
+    raise Exception(f"All API keys exhausted. Errors: {' | '.join(errors)}")
 
 def stage_1_recon(target):
     """STAGE 1: Simulate raw recon"""
@@ -50,7 +107,6 @@ def stage_1_recon(target):
 def stage_2_ai_analysis(raw_data):
     """STAGE 2: Gemini extracts signal from noise & maps MITRE"""
     print("[+] Running AI Stage 1: Threat Extraction...")
-    key = random.choice([k for k in API_KEYS if k]) # Pick a valid key
     
     prompt = f"""You are an expert Threat Intelligence Analyst. Analyze this raw recon data:
     {json.dumps(raw_data)}
@@ -67,7 +123,7 @@ def stage_2_ai_analysis(raw_data):
         }}
     ]"""
     
-    response_text = call_gemini(prompt, key)
+    response_text = call_gemini_with_retry(prompt)
     
     with open('./cache/processed_intel.json', 'w') as f:
         f.write(response_text)
@@ -76,8 +132,6 @@ def stage_2_ai_analysis(raw_data):
 def stage_3_ai_report(processed_intel):
     """STAGE 3: Gemini builds the final polished report"""
     print("[+] Running AI Stage 2: Report Generation...")
-    keys = [k for k in API_KEYS if k]
-    key = random.choice(keys)
     
     prompt = f"""You are a CISO reporting assistant. Take this threat intelligence JSON:
     {processed_intel}
@@ -89,7 +143,7 @@ def stage_3_ai_report(processed_intel):
     3. MITRE ATT&CK Attack Path
     4. Immediate Remediation Steps"""
     
-    response_text = call_gemini(prompt, key)
+    response_text = call_gemini_with_retry(prompt)
     
     with open('./cache/final_report.md', 'w') as f:
         f.write(response_text)
@@ -106,13 +160,22 @@ def stage_4_deliver(report_markdown):
     }
     
     try:
-        requests.post(CALLBACK_URL, json=payload)
-        print("[+] Delivery successful!")
+        resp = requests.post(CALLBACK_URL, json=payload, timeout=30)
+        print(f"[+] Delivery response: {resp.status_code}")
     except Exception as e:
         print(f"[-] Delivery failed: {e}")
 
 if __name__ == "__main__":
+    print(f"=== OMNISCIENCE ENGINE STARTED ===")
+    print(f"Target: {TARGET}")
+    print(f"Chat ID: {CHAT_ID}")
+    print(f"Callback: {CALLBACK_URL}")
+    print(f"API Keys loaded: {sum(1 for k in API_KEYS if k)}")
+    print(f"=================================")
+    
     raw = stage_1_recon(TARGET)
     intel = stage_2_ai_analysis(raw)
     report = stage_3_ai_report(intel)
     stage_4_deliver(report)
+    
+    print(f"=== OMNISCIENCE ENGINE COMPLETE ===")

@@ -10,7 +10,7 @@ on:
         description: 'Telegram Chat ID'
         required: true
       callback_url:
-        description: 'GAS Webhook URL'
+        description: 'Cloudflare/GAS Webhook URL'
         required: true
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests google-generativeai
+        run: pip install requests
 
       - name: Create Cache Directory
         run: mkdir -p ./cache

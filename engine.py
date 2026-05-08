@@ -2,14 +2,12 @@ import os
 import json
 import random
 import requests
-import google.generativeai as genai
 
 # --- CONFIGURATION ---
 TARGET = os.environ.get('TARGET')
 CHAT_ID = os.environ.get('CHAT_ID')
 CALLBACK_URL = os.environ.get('CALLBACK_URL')
 
-# Load the 6 Gemini API Keys
 API_KEYS = [
     os.environ.get('GEMINI_KEY_1'),
     os.environ.get('GEMINI_KEY_2'),
@@ -19,13 +17,19 @@ API_KEYS = [
     os.environ.get('GEMINI_KEY_6')
 ]
 
-def get_gemini_model(api_key):
-    """Initialize and return a Gemini model with a specific key"""
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-1.5-flash')
+def call_gemini(prompt, api_key):
+    """Raw REST API call to Gemini - Bulletproof method"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts":[{"text": prompt}]}]
+    }
+    response = requests.post(url, json=payload)
+    response.raise_for_status() # Fail fast if error
+    data = response.json()
+    return data['candidates'][0]['content']['parts'][0]['text']
 
 def stage_1_recon(target):
-    """STAGE 1: Simulate raw recon (We will add real scanners here in Phase 2)"""
+    """STAGE 1: Simulate raw recon"""
     print(f"[+] Running recon on {target}...")
     raw_data = {
         "target": target,
@@ -39,7 +43,6 @@ def stage_1_recon(target):
         "js_files": [f"https://{target}/app.js", f"https://{target}/vendor.js"]
     }
     
-    # Save raw data to cache
     with open('./cache/raw_data.json', 'w') as f:
         json.dump(raw_data, f, indent=2)
     return raw_data
@@ -47,8 +50,7 @@ def stage_1_recon(target):
 def stage_2_ai_analysis(raw_data):
     """STAGE 2: Gemini extracts signal from noise & maps MITRE"""
     print("[+] Running AI Stage 1: Threat Extraction...")
-    key = random.choice(API_KEYS)
-    model = get_gemini_model(key)
+    key = random.choice([k for k in API_KEYS if k]) # Pick a valid key
     
     prompt = f"""You are an expert Threat Intelligence Analyst. Analyze this raw recon data:
     {json.dumps(raw_data)}
@@ -65,19 +67,17 @@ def stage_2_ai_analysis(raw_data):
         }}
     ]"""
     
-    response = model.generate_content(prompt)
+    response_text = call_gemini(prompt, key)
     
-    # Save processed data to cache
     with open('./cache/processed_intel.json', 'w') as f:
-        f.write(response.text)
-    return response.text
+        f.write(response_text)
+    return response_text
 
 def stage_3_ai_report(processed_intel):
     """STAGE 3: Gemini builds the final polished report"""
     print("[+] Running AI Stage 2: Report Generation...")
-    # Use a DIFFERENT key to avoid rate limits
-    key = random.choice([k for k in API_KEYS if k != os.environ.get('GEMINI_KEY_1')])
-    model = get_gemini_model(key)
+    keys = [k for k in API_KEYS if k]
+    key = random.choice(keys)
     
     prompt = f"""You are a CISO reporting assistant. Take this threat intelligence JSON:
     {processed_intel}
@@ -89,16 +89,15 @@ def stage_3_ai_report(processed_intel):
     3. MITRE ATT&CK Attack Path
     4. Immediate Remediation Steps"""
     
-    response = model.generate_content(prompt)
+    response_text = call_gemini(prompt, key)
     
-    # Save final report to cache
     with open('./cache/final_report.md', 'w') as f:
-        f.write(response.text)
-    return response.text
+        f.write(response_text)
+    return response_text
 
 def stage_4_deliver(report_markdown):
-    """STAGE 4: Send report back to GAS for Google Doc creation"""
-    print("[+] Delivering report to GAS...")
+    """STAGE 4: Send report back to GAS via Cloudflare"""
+    print("[+] Delivering report to Cloudflare/GAS...")
     payload = {
         "action": "delivery",
         "target": TARGET,
@@ -113,7 +112,6 @@ def stage_4_deliver(report_markdown):
         print(f"[-] Delivery failed: {e}")
 
 if __name__ == "__main__":
-    # Execute the pipeline
     raw = stage_1_recon(TARGET)
     intel = stage_2_ai_analysis(raw)
     report = stage_3_ai_report(intel)

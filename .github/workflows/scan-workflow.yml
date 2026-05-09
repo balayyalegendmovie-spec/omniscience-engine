@@ -1,64 +1,260 @@
 name: OMNISCIENCE Scan Engine
 
 on:
+  repository_dispatch:
+    types: [vapt-scan]
+
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target Domain or IP'
+        description: 'Target Domain or URL'
         required: true
+
       chat_id:
         description: 'Telegram Chat ID'
         required: true
+
       callback_url:
-        description: 'Cloudflare/GAS Webhook URL'
+        description: 'Cloudflare Worker URL'
         required: true
+
       false_positives:
-        description: 'Comma-separated list of FP patterns'
+        description: 'Comma-separated false positive patterns'
         required: false
         default: ""
 
 env:
+  PYTHONUNBUFFERED: "1"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scan-and-analyze:
     runs-on: ubuntu-latest
+
+    timeout-minutes: 55
+
     permissions:
       contents: read
+      actions: read
       checks: write
-      actions: write
-    
+
     steps:
-      - name: Checkout Code
+
+      # ─────────────────────────────────────────────
+      # Checkout
+      # ─────────────────────────────────────────────
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # ─────────────────────────────────────────────
+      # Python
+      # ─────────────────────────────────────────────
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
+      # ─────────────────────────────────────────────
+      # System Packages
+      # ─────────────────────────────────────────────
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            dnsutils \
+            net-tools \
+            whois \
+            curl \
+            wget \
+            jq \
+            unzip \
+            git \
+            chromium-browser
+
+      # ─────────────────────────────────────────────
+      # Python Packages
+      # ─────────────────────────────────────────────
       - name: Install Python Dependencies
-        run: pip install requests playwright
+        run: |
+          python -m pip install --upgrade pip
 
-      - name: Install Playwright Browsers & System Deps
+          pip install \
+            requests \
+            urllib3 \
+            playwright \
+            dnspython \
+            google-generativeai \
+            beautifulsoup4 \
+            mmh3 \
+            python-whois \
+            pyOpenSSL \
+            cryptography \
+            shodan \
+            censys \
+            selenium
+
+      # ─────────────────────────────────────────────
+      # Playwright
+      # ─────────────────────────────────────────────
+      - name: Install Playwright Chromium
         run: |
           playwright install chromium
           playwright install-deps chromium
-          
-      - name: Create Cache Directory
-        run: mkdir -p ./cache/screenshots
 
-      - name: Run Engine (Scan + AI Analysis)
+      # ─────────────────────────────────────────────
+      # Cache / Screenshot dirs
+      # ─────────────────────────────────────────────
+      - name: Create Runtime Directories
+        run: |
+          mkdir -p ./cache
+          mkdir -p ./cache/screenshots
+          mkdir -p ./reports
+          mkdir -p ./logs
+
+      # ─────────────────────────────────────────────
+      # Resolve Inputs
+      # Supports BOTH:
+      # - repository_dispatch
+      # - workflow_dispatch
+      # ─────────────────────────────────────────────
+      - name: Resolve Runtime Inputs
+        id: vars
+        run: |
+
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+
+            echo "TARGET=${{ github.event.client_payload.target_url }}" >> $GITHUB_ENV
+            echo "CHAT_ID=${{ github.event.client_payload.chat_id }}" >> $GITHUB_ENV
+
+            # fallback if callback_url absent
+            echo "CLOUDFLARE_WORKER_URL=${{ github.event.client_payload.callback_url || secrets.CLOUDFLARE_WORKER_URL }}" >> $GITHUB_ENV
+
+            echo "FALSE_PATTERNS=${{ github.event.client_payload.false_positives || '' }}" >> $GITHUB_ENV
+
+          else
+
+            echo "TARGET=${{ github.event.inputs.target }}" >> $GITHUB_ENV
+            echo "CHAT_ID=${{ github.event.inputs.chat_id }}" >> $GITHUB_ENV
+            echo "CLOUDFLARE_WORKER_URL=${{ github.event.inputs.callback_url }}" >> $GITHUB_ENV
+            echo "FALSE_PATTERNS=${{ github.event.inputs.false_positives }}" >> $GITHUB_ENV
+
+          fi
+
+      # ─────────────────────────────────────────────
+      # Gemini API Key Rotation
+      # Random selection from stored secrets
+      # ─────────────────────────────────────────────
+      - name: Select Gemini API Key
+        run: |
+
+          KEYS=(
+            "${{ secrets.GEMINI_API_KEY_1 }}"
+            "${{ secrets.GEMINI_API_KEY_2 }}"
+            "${{ secrets.GEMINI_API_KEY_3 }}"
+            "${{ secrets.GEMINI_API_KEY_4 }}"
+            "${{ secrets.GEMINI_API_KEY_5 }}"
+            "${{ secrets.GEMINI_API_KEY_6 }}"
+          )
+
+          VALID_KEYS=()
+
+          for key in "${KEYS[@]}"; do
+            if [ ! -z "$key" ]; then
+              VALID_KEYS+=("$key")
+            fi
+          done
+
+          COUNT=${#VALID_KEYS[@]}
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No Gemini API keys configured"
+            exit 1
+          fi
+
+          RANDOM_INDEX=$(( RANDOM % COUNT ))
+
+          echo "GEMINI_API_KEY=${VALID_KEYS[$RANDOM_INDEX]}" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────────
+      # Debug Runtime Variables
+      # ─────────────────────────────────────────────
+      - name: Validate Runtime
+        run: |
+
+          echo "TARGET=$TARGET"
+
+          if [ -z "$TARGET" ]; then
+            echo "TARGET missing"
+            exit 1
+          fi
+
+          if [ -z "$CHAT_ID" ]; then
+            echo "CHAT_ID missing"
+            exit 1
+          fi
+
+          if [ -z "$CLOUDFLARE_WORKER_URL" ]; then
+            echo "CLOUDFLARE_WORKER_URL missing"
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────
+      # Run Engine
+      # ─────────────────────────────────────────────
+      - name: Run OMNISCIENCE Engine
         env:
-          TARGET: ${{ github.event.inputs.target }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CALLBACK_URL: ${{ github.event.inputs.callback_url }}
-          FALSE_PATTERNS: ${{ github.event.inputs.false_positives }}
-          GEMINI_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
-          GEMINI_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
-          GEMINI_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
-          GEMINI_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
-          GEMINI_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
-          GEMINI_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
-          GITHUB_STEP_SUMMARY: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
-        run: python engine.py
+          TARGET: ${{ env.TARGET }}
+          CHAT_ID: ${{ env.CHAT_ID }}
+
+          CLOUDFLARE_WORKER_URL: ${{ env.CLOUDFLARE_WORKER_URL }}
+
+          FALSE_PATTERNS: ${{ env.FALSE_PATTERNS }}
+
+          GEMINI_API_KEY: ${{ env.GEMINI_API_KEY }}
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+
+          CENSYS_API_ID: ${{ secrets.CENSYS_API_ID }}
+          CENSYS_API_SECRET: ${{ secrets.CENSYS_API_SECRET }}
+
+          SECURITYTRAILS_API_KEY: ${{ secrets.SECURITYTRAILS_API_KEY }}
+
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+
+          THREADS: "20"
+          TIMEOUT: "15"
+
+          RATE_LIMIT_DELAY: "0.5"
+
+          MAX_SCREENSHOTS: "5"
+
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+
+        run: |
+          python engine.py
+
+      # ─────────────────────────────────────────────
+      # Upload Logs
+      # ─────────────────────────────────────────────
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniscience-artifacts
+          path: |
+            ./cache
+            ./reports
+            ./logs
+          retention-days: 7
+
+      # ─────────────────────────────────────────────
+      # Failure Visibility
+      # ─────────────────────────────────────────────
+      - name: Failure Notice
+        if: failure()
+        run: |
+          echo "Workflow failed"
+```

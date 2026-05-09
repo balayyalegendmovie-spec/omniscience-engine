@@ -24,7 +24,6 @@ ADVANCED_ENDPOINTS = ['/api/v1', '/swagger-ui.html', '/swagger.json', '/openapi.
 REDIRECT_PARAMS = ['url', 'redirect', 'next', 'continue', 'return', 'dest', 'target']
 SECURITY_HEADERS = ['Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy', 'X-Content-Type-Options']
 
-# Regex for Hardcoded Secrets in JS
 SECRET_PATTERNS = {
     "Google API Key": r"AIza[0-9A-Za-z_-]{35}",
     "AWS Access Key": r"AKIA[0-9A-Z]{16}",
@@ -32,8 +31,19 @@ SECRET_PATTERNS = {
     "GitHub Token": r"gh[pousr]_[A-Za-z0-9_]{36,}",
     "Private Key": r"-----BEGIN (RSA|OPENSSH|DSA|EC) PRIVATE KEY-----",
     "MongoDB URI": r"mongodb(?:\+srv)?://[^\s\"']+",
-    "MySQL URI": r"mysql://[^\s\"']+",
-    "Generic Secret": r"(?:secret_key|api_key|apikey|password|passwd)\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+    "Generic Secret": r"(?:secret_key|api_key|password)\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+}
+
+# Subdomain Takeover Fingerprints
+TAKEOVER_FINGERPRINTS = {
+    "aws_s3": ["NoSuchBucket", "The specified bucket does not exist"],
+    "heroku": ["No such app", "herokucdn"],
+    "shopify": ["Sorry, this shop is currently unavailable"],
+    "github": ["There isn't a GitHub Pages site here"],
+    "pantheon": ["404 error unknown site", "Pantheon"],
+    "zendesk": ["Help Center Closed", "zendesk.com"],
+    "tumblr": ["Whatever you were looking for doesn't currently exist"],
+    "wordpress": ["Do you want to register"]
 }
 
 # ==========================================
@@ -67,29 +77,44 @@ def resolve_dns(s):
     except: return None
 
 def probe_subdomain(sub):
-    res = {"host": sub, "ip": None, "is_cdn": False, "http_status": None, "title": None, "server": None, "technologies": [], "missing_headers": [], "sensitive_files": [], "hidden_api_endpoints": [], "js_files": []}
+    res = {
+        "host": sub, "ip": None, "is_cdn": False, "http_status": None, 
+        "title": None, "server": None, "technologies": [], "missing_headers": [], 
+        "sensitive_files": [], "hidden_api_endpoints": [], "js_files": [], 
+        "cookie_issues": [], "data_leaks": [], "open_redirects": [], "cors_issue": None
+    }
     ip = resolve_dns(sub)
     if not ip: return res
     res["ip"] = ip
+    
     for scheme in ['https', 'http']:
         try:
             r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
             res["http_status"] = r.status_code
+            
             if "<title>" in r.text.lower():
                 s = r.text.lower().find("<title>") + 7; e = r.text.lower().find("</title>", s)
                 res["title"] = r.text[s:e].strip()[:100]
+            
             server = r.headers.get("Server", "Unknown")
             res["server"] = server
             if any(cdn in server.lower() for cdn in CDN_SERVERS): res["is_cdn"] = True
+            
             techs = []
             if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
+            if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
             res["technologies"] = techs
+            
             res["missing_headers"] = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
             res["hidden_api_endpoints"] = list(set(re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin)/[^"\']*)(?:["\'])', r.text)))[:10]
+            res["js_files"] = [requests.compat.urljoin(f"{scheme}://{sub}", link) for link in re.findall(r'(?:src=["\'])([^"\']+\.js(?:\?[^"\']*)?)', r.text)[:5]]
             
-            # Extract JS file paths
-            js_links = re.findall(r'(?:src=["\'])([^"\']+\.js(?:\?[^"\']*)?)', r.text)
-            res["js_files"] = [requests.compat.urljoin(f"{scheme}://{sub}", link) for link in js_links[:5]] # Top 5 JS files
+            # RESTORED: Cookie Security Checks
+            bad_cookies = []
+            for cookie in r.cookies:
+                if not cookie.secure: bad_cookies.append(f"Cookie '{cookie.name}' missing Secure flag")
+                if not cookie.has_nonstandard_attr('httponly'): bad_cookies.append(f"Cookie '{cookie.name}' missing HttpOnly")
+            res["cookie_issues"] = bad_cookies
             
             break
         except: continue
@@ -151,7 +176,7 @@ def discover_cloud_assets(t):
 def stage_1_5_osint(t): return {"github_leaks": github_secret_dorking(t), "cloud_assets": discover_cloud_assets(t)}
 
 # ==========================================
-# STAGE 2: WEB AUDIT
+# STAGE 2: WEB AUDIT (FULLY RESTORED)
 # ==========================================
 def check_path(u, p):
     try:
@@ -173,45 +198,58 @@ def check_cors(u):
             return {"issue": "CORS Misconfiguration (Allows evil.com with Credentials)"}
     except: pass
 
+# RESTORED: Error Leak Provocation
+def check_error_leaks(u):
+    leaks = []
+    for p in ["'", "{{7*7}}"]:
+        try:
+            r = requests.get(f"{u}/?id={p}", timeout=4, verify=False)
+            text = r.text.lower()
+            if "sql syntax" in text or "mysql_" in text: leaks.append({"type": "SQL Error Leak", "payload": p})
+            elif "49" in r.text and p == "{{7*7}}": leaks.append({"type": "SSTI Detected", "payload": p})
+        except: pass
+    return leaks
+
 def stage_2_web_audit(assets):
     print(f"[+] Web Audit...")
     for a in assets:
         if not a["http_status"]: continue
         b = f"https://{a['host']}"
+        
         found = []
         with ThreadPoolExecutor(max_workers=20) as ex:
             for f in as_completed([ex.submit(check_path, b, p) for p in SENSITIVE_PATHS + ADVANCED_ENDPOINTS]):
                 res = f.result()
                 if res: found.append(res)
         a["sensitive_files"] = found
+        
         redirs = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             for f in as_completed([ex.submit(check_redirect, b, p) for p in REDIRECT_PARAMS]):
                 res = f.result()
                 if res: redirs.append(res)
         a["open_redirects"] = redirs
+        
         a["cors_issue"] = check_cors(b)
+        a["data_leaks"] = check_error_leaks(b) # RESTORED
     return assets
 
 # ==========================================
-# STAGE 2.5: HISTORICAL & DEEP JS (NEW!)
+# STAGE 2.5: HISTORY & JS SECRETS
 # ==========================================
 def fetch_wayback_urls(target):
-    print(f"[+] Fetching Wayback Machine history...")
+    print(f"[+] Wayback Machine history...")
     interesting_paths = set()
     try:
         r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=200", timeout=15)
         if r.status_code == 200:
-            data = r.json()
-            for entry in data[1:]: # Skip header
-                url = entry[0]
-                path = urlparse(url).path
-                # Only keep "interesting" paths (admin, api, config, login, dashboard)
+            for entry in r.json()[1:]:
+                path = urlparse(entry[0]).path
                 if any(kw in path.lower() for kw in ['admin', 'api', 'config', 'login', 'dashboard', 'upload', 'db', 'user', 'env']):
                     interesting_paths.add(path)
     except: pass
     print(f"[+] Wayback found {len(interesting_paths)} interesting historical endpoints.")
-    return list(interesting_paths)[:30] # Cap at 30 to save time
+    return list(interesting_paths)[:30]
 
 def extract_js_secrets(js_urls):
     print(f"[+] Analyzing {len(js_urls)} JS files for secrets...")
@@ -221,15 +259,12 @@ def extract_js_secrets(js_urls):
             r = requests.get(url, timeout=5, verify=False)
             for name, pattern in SECRET_PATTERNS.items():
                 matches = re.findall(pattern, r.text)
-                for m in matches:
-                    found_secrets.append({"file": url, "type": name, "value": m[:50] + "..." if len(m) > 50 else m})
+                for m in matches: found_secrets.append({"file": url, "type": name, "value": m[:50] + "..." if len(m) > 50 else m})
         except: pass
     return found_secrets
 
 def stage_2_5_history_and_secrets(assets, target):
     historical_paths = fetch_wayback_urls(target)
-    
-    # Probe historical paths on alive assets
     for a in assets:
         if not a["http_status"]: continue
         b = f"https://{a['host']}"
@@ -239,14 +274,55 @@ def stage_2_5_history_and_secrets(assets, target):
                 res = f.result()
                 if res and res["status"] == 200: found_hist.append(res)
         a["historical_endpoints"] = found_hist
-        
-        # Extract secrets from JS
-        if a.get("js_files"):
-            a["js_secrets"] = extract_js_secrets(a["js_files"])
-        else:
-            a["js_secrets"] = []
-            
+        a["js_secrets"] = extract_js_secrets(a.get("js_files", []))
     return assets
+
+# ==========================================
+# STAGE 2.8: SUBDOMAIN TAKEOVER (NEW!)
+# ==========================================
+def check_takeover(sub):
+    try:
+        # 1. Get CNAME using Google Public DNS API
+        r = requests.get(f"https://dns.google/resolve?name={sub}&type=CNAME", timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            answers = data.get("Answer", [])
+            for ans in answers:
+                cname = ans.get("data", "").lower()
+                if cname:
+                    # 2. Check if CNAME points to a known cloud provider
+                    vulnerable_provider = None
+                    if "s3.amazonaws.com" in cname: vulnerable_provider = "aws_s3"
+                    elif "herokuapp.com" in cname: vulnerable_provider = "heroku"
+                    elif "myshopify.com" in cname: vulnerable_provider = "shopify"
+                    elif "github.io" in cname: vulnerable_provider = "github"
+                    elif "pantheon.io" in cname: vulnerable_provider = "pantheon"
+                    elif "zendesk.com" in cname: vulnerable_provider = "zendesk"
+                    elif "tumblr.com" in cname: vulnerable_provider = "tumblr"
+                    elif "wordpress.com" in cname: vulnerable_provider = "wordpress"
+                    
+                    if vulnerable_provider:
+                        # 3. Fetch the page and look for takeover error fingerprints
+                        try:
+                            web_r = requests.get(f"http://{sub}", timeout=5, verify=False)
+                            for fp in TAKEOVER_FINGERPRINTS.get(vulnerable_provider, []):
+                                if fp.lower() in web_r.text.lower():
+                                    return {"subdomain": sub, "cname": cname, "provider": vulnerable_provider, "fingerprint": fp, "severity": "CRITICAL"}
+                        except: pass
+    except: pass
+    return None
+
+def stage_2_8_takeover_scan(assets):
+    print(f"[+] Checking for Subdomain Takeovers...")
+    takeovers = []
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futs = {ex.submit(check_takeover, a["host"]): a["host"] for a in assets if a["ip"]}
+        for f in as_completed(futs):
+            res = f.result()
+            if res: 
+                takeovers.append(res)
+                print(f"[!] TAKEOVER FOUND: {res['subdomain']} -> {res['provider']}")
+    return takeovers
 
 # ==========================================
 # STAGE 3 & 3.5: PORTS & MEMORY
@@ -295,21 +371,37 @@ def call_gemini_retry(prompt):
         except Exception as e: print(f"[-] Fail: {e}")
     raise Exception("Keys dead")
 
-def stage_4_ai(data, osint):
+def stage_4_ai(data, osint, takeovers):
     print("[+] AI Stage 1...")
     prompt = f"""You are a Tier-1 Red Team Operator. Analyze this data for '{TARGET}':
-    --- NETWORK & WEB ---
+    --- NETWORK & WEB --- 
     {json.dumps(data, indent=2)}
     --- OSINT ---
     {json.dumps(osint, indent=2)}
-    STRICT RULES: DO NOT GUESS. If GitHub leaks/Cloud assets found -> CRITICAL. If hardcoded JS secrets found -> CRITICAL. If historical endpoints (admin/login) are alive -> HIGH. Explain What, Why, How for each. Map to OWASP/MITRE.
+    --- SUBDOMAIN TAKEOVERS ---
+    {json.dumps(takeovers, indent=2)}
+    
+    STRICT RULES: DO NOT GUESS. 
+    If Takeovers found -> CRITICAL. Explain exactly how to claim the DNS.
+    If GitHub leaks/Cloud assets found -> CRITICAL. 
+    If hardcoded JS secrets found -> CRITICAL. 
+    If historical endpoints (admin/login) are alive -> HIGH. 
+    For SSTI/SQLi data leaks, explain the payload used.
+    Map to OWASP/MITRE.
     Output strictly as JSON array: [{{"asset": "...", "what_was_found": "...", "why_its_vulnerable": "...", "how_to_exploit": "...", "severity": "...", "owasp": "...", "mitre": "..."}}]"""
     return call_gemini_retry(prompt)
 
 def stage_5_report(intel):
     print("[+] AI Stage 2...")
     prompt = f"""You are a CISO assistant. Format this intel for '{TARGET}': {intel}
-    Markdown report with: 1. 🎯 Exec Summary (Risk /100). 2. ☣️ OSINT/Leaks/JS Secrets (CRITICAL). 3. 🗺️ Attack Map. 4. 🚨 Vulns (Include Historical Endpoints). 5. 🛡️ OWASP/MITRE. 6. 🔧 Fixes."""
+    Markdown report with: 
+    1. 🎯 Exec Summary (Risk /100). 
+    2. ☣️ OSINT/Leaks/JS Secrets (CRITICAL). 
+    3. 💀 Subdomain Takeovers (CRITICAL - Provide step-by-step how an attacker would steal it).
+    4. 🗺️ Attack Map. 
+    5. 🚨 Vulns (Include Historical Endpoints, SSTI/SQLi probes, CORS, Cookies). 
+    6. 🛡️ OWASP/MITRE. 
+    7. 🔧 Fixes."""
     return call_gemini_retry(intel)
 
 def deliver(report):
@@ -317,16 +409,17 @@ def deliver(report):
     requests.post(CALLBACK_URL, json={"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}, timeout=30)
 
 if __name__ == "__main__":
-    print(f"=== OMNISCIENCE v3.0 (History & Secrets) STARTED ===")
+    print(f"=== OMNISCIENCE v3.1 (Takeover Edition) STARTED ===")
     assets = stage_1_recon(TARGET)
     osint = stage_1_5_osint(TARGET)
-    assets = stage_2_web_audit(assets)
-    assets = stage_2_5_history_and_secrets(assets, TARGET) # NEW
+    assets = stage_2_web_audit(assets) # RESTORED fully
+    assets = stage_2_5_history_and_secrets(assets, TARGET)
+    takeovers = stage_2_8_takeover_scan(assets) # NEW
     full = stage_3_network_scan(assets)
     full = apply_memory_filter(full)
     
-    with open('./cache/raw.json', 'w') as f: json.dump({"target": TARGET, "assets": full, "osint": osint}, f, indent=2)
-    intel = stage_4_ai(full, osint)
+    with open('./cache/raw.json', 'w') as f: json.dump({"target": TARGET, "assets": full, "osint": osint, "takeovers": takeovers}, f, indent=2)
+    intel = stage_4_ai(full, osint, takeovers)
     with open('./cache/intel.json', 'w') as f: f.write(intel)
     report = stage_5_report(intel)
     with open('./cache/report.md', 'w') as f: f.write(report)

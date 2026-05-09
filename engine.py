@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- CONFIGURATION ---
 TARGET = os.environ.get('TARGET')
 CHAT_ID = os.environ.get('CHAT_ID')
 CALLBACK_URL = os.environ.get('CALLBACK_URL')
@@ -19,132 +18,154 @@ API_KEYS = [
     os.environ.get('GEMINI_KEY_5'), os.environ.get('GEMINI_KEY_6')
 ]
 
-# Top 50 critical ports to scan (No Nmap needed, pure Python sockets)
-TOP_PORTS = [
-    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 
-    143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389,
-    5432, 5900, 6379, 8080, 8443, 8888, 9090, 9200, 27017, 11211,
-    5000, 5001, 8000, 8001, 8181, 8500, 9000, 9443, 10000, 10443,
-    2222, 22222, 4443, 6080, 7080, 7443, 8090, 8800, 9080, 16080
-]
+TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
+
+CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'awselb', 'fastly']
 
 # ==========================================
-# STAGE 1: RECON (Subdomains & Web)
+# STAGE 1: DEEP RECON (Real Data Only)
 # ==========================================
-def fetch_crtsh_subdomains(target):
-    print(f"[+] Querying crt.sh for {target}...")
-    subdomains = set()
+def fetch_crtsh(target):
+    subs = set()
     try:
-        url = f"https://crt.sh/?q=%.{target}&output=json"
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            for entry in data:
-                name = entry.get('name_value', '')
-                for sub in name.split('\n'):
+        r = requests.get(f"https://crt.sh/?q=%.{target}&output=json", timeout=20)
+        if r.status_code == 200:
+            for entry in r.json():
+                for sub in entry.get('name_value', '').split('\n'):
                     sub = sub.strip().lower()
-                    if not sub.startswith('*') and sub.endswith(target):
-                        subdomains.add(sub)
-        print(f"[+] crt.sh found {len(subdomains)} unique subdomains.")
-    except Exception as e:
-        print(f"[-] crt.sh lookup failed: {e}")
-    return list(subdomains)
+                    if not sub.startswith('*') and sub.endswith(target): subs.add(sub)
+    except: pass
+    return subs
 
-def resolve_dns(subdomain):
-    try: return socket.gethostbyname(subdomain)
-    except socket.gaierror: return None
+def fetch_hackertarget(target):
+    subs = set()
+    try:
+        r = requests.get(f"https://api.hackertarget.com/hostsearch/?q={target}", timeout=10)
+        if r.status_code == 200 and "error" not in r.text.lower():
+            for line in r.text.splitlines():
+                parts = line.split(",")
+                if len(parts) == 2: subs.add(parts[0].strip().lower())
+    except: pass
+    return subs
 
-def probe_subdomain(subdomain):
-    result = {"host": subdomain, "ip": None, "http_status": None, "title": None, "server": None}
-    ip = resolve_dns(subdomain)
+def resolve_dns(sub):
+    try: return socket.gethostbyname(sub)
+    except: return None
+
+def probe_subdomain(sub):
+    result = {
+        "host": sub, "ip": None, "is_cdn": False, "cdn_provider": None,
+        "http_status": None, "title": None, "server": None, 
+        "technologies": [], "security_headers": {}
+    }
+    
+    ip = resolve_dns(sub)
     if not ip: return result
     result["ip"] = ip
-    
+
     for scheme in ['https', 'http']:
         try:
-            url = f"{scheme}://{subdomain}"
-            response = requests.get(url, timeout=5, verify=False, allow_redirects=True)
-            result["http_status"] = response.status_code
-            if "<title>" in response.text.lower():
-                start = response.text.lower().find("<title>") + 7
-                end = response.text.lower().find("</title>", start)
-                result["title"] = response.text[start:end].strip()[:100]
-            result["server"] = response.headers.get("Server", "Unknown")
-            result["scheme"] = scheme
+            r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
+            result["http_status"] = r.status_code
+            
+            # Title
+            if "<title>" in r.text.lower():
+                s = r.text.lower().find("<title>") + 7
+                e = r.text.lower().find("</title>", s)
+                result["title"] = r.text[s:e].strip()[:100]
+            
+            # Server & CDN Check
+            server = r.headers.get("Server", "Unknown")
+            result["server"] = server
+            if any(cdn in server.lower() for cdn in CDN_SERVERS):
+                result["is_cdn"] = True
+                result["cdn_provider"] = server
+            
+            # Real Tech Fingerprinting (No guessing)
+            techs = []
+            if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
+            if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
+            if "wordpress" in r.text.lower()[:2000]: techs.append("WordPress Detected")
+            if "joomla" in r.text.lower()[:2000]: techs.append("Joomla Detected")
+            if "drupal" in r.text.lower()[:2000]: techs.append("Drupal Detected")
+            result["technologies"] = techs
+            
+            # Quick Security Header Check
+            result["security_headers"] = {
+                "Strict-Transport-Security": bool(r.headers.get("Strict-Transport-Security")),
+                "X-Frame-Options": bool(r.headers.get("X-Frame-Options")),
+                "Content-Security-Policy": bool(r.headers.get("Content-Security-Policy"))
+            }
             break
-        except requests.RequestException: continue
+        except: continue
     return result
 
 def stage_1_recon(target):
-    print(f"[+] Starting deep recon on {target}...")
-    subdomains = fetch_crtsh_subdomains(target)
-    if target not in subdomains: subdomains.append(target)
+    print(f"[+] Starting Deep Recon on {target}...")
     
-    print(f"[+] Probing {len(subdomains)} subdomains concurrently...")
-    probed_data = []
+    # 1. Enumerate from multiple sources
+    subs = fetch_crtsh(target) | fetch_hackertarget(target)
+    if target in subs: subs.add(target)
+    print(f"[+] Found {len(subs)} unique subdomains from APIs.")
+    
+    # 2. Probe concurrently
+    print(f"[+] Probing {len(subs)} subdomains...")
+    alive_assets = []
     with ThreadPoolExecutor(max_workers=25) as executor:
-        future_to_sub = {executor.submit(probe_subdomain, sub): sub for sub in subdomains}
-        for future in as_completed(future_to_sub):
+        futures = {executor.submit(probe_subdomain, sub): sub for sub in subs}
+        for future in as_completed(futures):
             try:
-                result = future.result()
-                if result["ip"]: probed_data.append(result)
+                res = future.result()
+                if res["ip"]: alive_assets.append(res)
             except: pass
     
-    probed_data.sort(key=lambda x: (x['http_status'] or 999))
-    print(f"[+] Web recon complete. {len(probed_data)} alive hosts found.")
-    return probed_data
+    print(f"[+] {len(alive_assets)} hosts alive. Filtering CDN for port scan...")
+    return alive_assets
 
 # ==========================================
-# STAGE 2: NETWORK (Port Scanning)
+# STAGE 2: ORIGIN PORT SCANNING
 # ==========================================
 def scan_port(ip, port):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.5) # Fast timeout
-        result = s.connect_ex((ip, port))
+        s.settimeout(1.5)
+        if s.connect_ex((ip, port)) == 0: return port
         s.close()
-        if result == 0: return port
-        return None
-    except: return None
+    except: pass
+    return None
 
-def stage_2_network_scan(alive_assets):
-    print(f"[+] Starting network port scanning on {len(alive_assets)} assets...")
-    network_data = []
+def stage_2_network_scan(assets):
+    origin_assets = [a for a in assets if not a["is_cdn"]]
+    cdn_assets = [a for a in assets if a["is_cdn"]]
     
-    for asset in alive_assets:
-        ip = asset.get("ip")
-        if not ip: continue
-        
+    print(f"[+] {len(cdn_assets)} assets behind CDN (skipping port scan).")
+    print(f"[+] {len(origin_assets)} Origin assets found. Scanning top ports...")
+    
+    for asset in origin_assets:
+        ip = asset["ip"]
         open_ports = []
         with ThreadPoolExecutor(max_workers=50) as executor:
-            future_to_port = {executor.submit(scan_port, ip, port): port for port in TOP_PORTS}
-            for future in as_completed(future_to_port):
-                try:
-                    port = future.result()
-                    if port: open_ports.append(port)
-                except: pass
+            futures = {executor.submit(scan_port, ip, p): p for p in TOP_PORTS}
+            for future in as_completed(futures):
+                port = future.result()
+                if port: open_ports.append(port)
+        asset["open_ports"] = sorted(open_ports) if open_ports else []
+        if open_ports: print(f"  -> {asset['host']} ({ip}): Ports {open_ports}")
+
+    # Mark CDN assets as having unscanned ports
+    for a in cdn_assets: a["open_ports"] = ["CDN Protected - Not Scanned"]
         
-        if open_ports:
-            open_ports.sort()
-            asset["open_ports"] = open_ports
-            network_data.append(asset)
-            print(f"  -> {asset['host']} ({ip}): {len(open_ports)} open ports found {open_ports}")
-        else:
-            asset["open_ports"] = []
-            network_data.append(asset)
-            
-    print(f"[+] Network scanning complete.")
-    return network_data
+    return origin_assets + cdn_assets
 
 # ==========================================
-# STAGE 3 & 4: AI ANALYSIS & REPORTING
+# AI STAGES (Strict Evidence Only)
 # ==========================================
 def call_gemini(prompt, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-    payload = {"contents": [{"parts":[{"text": prompt}]}], "generationConfig": { "temperature": 0.7, "maxOutputTokens": 8192 }}
-    response = requests.post(url, json=payload, timeout=90)
-    response.raise_for_status()
-    return response.json()['candidates'][0]['content']['parts'][0]['text']
+    payload = {"contents": [{"parts":[{"text": prompt}]}], "generationConfig": { "temperature": 0.4, "maxOutputTokens": 8192 }}
+    r = requests.post(url, json=payload, timeout=90)
+    r.raise_for_status()
+    return r.json()['candidates'][0]['content']['parts'][0]['text']
 
 def call_gemini_with_retry(prompt):
     keys = [k for k in API_KEYS if k]
@@ -157,87 +178,70 @@ def call_gemini_with_retry(prompt):
             print(f"[-] Key #{i+1} failed: {str(e)}")
     raise Exception("All API keys exhausted.")
 
-def stage_3_ai_analysis(recon_data):
-    print("[+] Running AI Stage 1: Deep Threat Extraction...")
-    prompt = f"""You are an expert Threat Intelligence Analyst. Analyze this combined recon and network data for '{TARGET}':
-    {json.dumps(recon_data, indent=2)}
+def stage_3_ai_analysis(data):
+    print("[+] Running AI Stage 1: Evidence Extraction...")
+    prompt = f"""You are a strict, evidence-only Threat Intelligence Analyst. Analyze this raw scan data for '{TARGET}':
+    {json.dumps(data, indent=2)}
     
-    Focus on:
-    1. Exposed administrative ports (22, 3389, 5900, 3306, 6379, 27017) accessible to the internet.
-    2. Dangerous service combinations (e.g., Web + FTP + Database open on same host).
-    3. Outdated web technologies found in Stage 1.
-    4. Map potential attack vectors to MITRE ATT&CK (Tactic, Technique).
+    STRICT RULES:
+    1. DO NOT GUESS technologies. If the data only says "cloudflare", state "Cloudflare CDN". Do NOT invent "Tomcat" or "Jenkins" unless explicitly found in the technologies array.
+    2. ONLY flag open ports that are actually in the "open_ports" array.
+    3. If an asset is behind a CDN, note that it is protected and cannot be directly attacked via network ports.
+    4. Flag missing security headers as informational findings.
+    5. Map ONLY proven risks to MITRE ATT&CK.
     
     Output strictly as JSON array:
     [
         {{
             "asset": "subdomain.target.com",
             "ip": "x.x.x.x",
-            "finding": "Description of the vulnerability/exposure",
+            "finding": "Exact description of what was found",
             "severity": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
             "mitre_tactic": "Tactic (TA####)",
             "mitre_technique": "Technique (T####)",
-            "evidence": "Ports open / Headers found / Reasoning"
+            "evidence": "Exact proof from the data (e.g., 'Port 22 open', 'X-Powered-By: PHP')")
         }}
     ]"""
     return call_gemini_with_retry(prompt)
 
-def stage_4_ai_report(processed_intel):
-    print("[+] Running AI Stage 2: Final Report Generation...")
-    prompt = f"""You are a CISO reporting assistant. Take this threat intelligence JSON for '{TARGET}':
-    {processed_intel}
+def stage_4_ai_report(intel):
+    print("[+] Running AI Stage 2: Final Report...")
+    prompt = f"""You are a CISO reporting assistant. Take this evidence-based intelligence for '{TARGET}':
+    {intel}
     
-    Write a clean, formatted Markdown report. Include:
-    1. 🎯 **Executive Summary:** (Risk score out of 100, brief overview)
-    2. 🗺️ **Attack Surface Map:** Summarize alive hosts, technologies, and exposed ports.
-    3. 🚨 **Critical Findings:** A table of the highest severity items (include open ports in the table!).
-    4. 🛡️ **MITRE ATT&CK Mapping:** Group findings by Tactic.
-    5. 🔗 **Attack Paths:** Chain 1-2 realistic attack scenarios (e.g., "Open SSH -> Brute force -> Lateral movement to exposed DB").
-    6. 🔧 **Remediation Steps:** Immediate actions to take.
+    Write a professional Markdown report. 
+    CRITICAL: Base EVERY statement on the provided evidence. Do not hallucinate or guess technologies.
     
-    Make it look professional with emojis and clean Markdown."""
-    return call_gemini_with_retry(prompt)
+    Include:
+    1. 🎯 **Executive Summary:** (Risk score out of 100 based strictly on findings)
+    2. 🗺️ **Attack Surface Map:** Differentiate between CDN-protected assets and exposed Origin assets.
+    3. 🚨 **Findings Table:** Only include facts (actual open ports, detected tech, missing headers).
+    4. 🛡️ **MITRE ATT&CK Mapping:** Based ONLY on the evidence.
+    5. 🔧 **Remediation Steps:** Actionable advice based strictly on what was found."""
+    return call_gemini_with_retry(intel)
 
 # ==========================================
-# STAGE 5: DELIVERY
+# DELIVERY & MAIN
 # ==========================================
-def stage_5_deliver(report_markdown):
-    print("[+] Delivering report to Cloudflare/GAS...")
-    payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report_markdown}
-    try:
-        resp = requests.post(CALLBACK_URL, json=payload, timeout=30)
-        print(f"[+] Delivery response: {resp.status_code}")
-    except Exception as e:
-        print(f"[-] Delivery failed: {e}")
+def stage_5_deliver(report):
+    print("[+] Delivering report...")
+    payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}
+    try: requests.post(CALLBACK_URL, json=payload, timeout=30)
+    except Exception as e: print(f"[-] Failed: {e}")
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
 if __name__ == "__main__":
     print(f"=== OMNISCIENCE ENGINE STARTED ===")
-    print(f"Target: {TARGET}")
+    assets = stage_1_recon(TARGET)
+    full_data = stage_2_network_scan(assets)
     
-    # Stage 1: Web & Subdomain Recon
-    alive_assets = stage_1_recon(TARGET)
-    
-    # Stage 2: Network Port Scanning
-    full_recon_data = stage_2_network_scan(alive_assets)
-    
-    # Save full combined data to cache
     with open('./cache/raw_data.json', 'w') as f:
-        json.dump({"target": TARGET, "assets": full_recon_data}, f, indent=2)
+        json.dump({"target": TARGET, "assets": full_data}, f, indent=2)
     
-    # Stage 3: AI Analysis
-    intel = stage_3_ai_analysis(full_recon_data)
-    with open('./cache/processed_intel.json', 'w') as f:
-        f.write(intel)
+    intel = stage_3_ai_analysis(full_data)
+    with open('./cache/processed_intel.json', 'w') as f: f.write(intel)
         
-    # Stage 4: AI Reporting
     report = stage_4_ai_report(intel)
-    with open('./cache/final_report.md', 'w') as f:
-        f.write(report)
+    with open('./cache/final_report.md', 'w') as f: f.write(report)
         
-    # Stage 5: Delivery
     stage_5_deliver(report)
-    
     print(f"=== OMNISCIENCE ENGINE COMPLETE ===")

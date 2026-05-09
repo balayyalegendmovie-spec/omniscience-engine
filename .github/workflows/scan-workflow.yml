@@ -18,7 +18,7 @@ on:
         default: ""
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Fixes Node 20 deprecation warning
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scan-and-analyze:
@@ -26,7 +26,7 @@ jobs:
     permissions:
       contents: read
       checks: write
-      actions: write # Required for Job Summaries
+      actions: write
     
     steps:
       - name: Checkout Code
@@ -37,11 +37,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
-        run: pip install requests
+      - name: Install Python Dependencies
+        run: pip install requests playwright
 
+      - name: Install Playwright Browsers & System Deps
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+          
       - name: Create Cache Directory
-        run: mkdir -p ./cache
+        run: mkdir -p ./cache/screenshots
 
       - name: Run Engine (Scan + AI Analysis)
         env:
@@ -55,5 +60,5 @@ jobs:
           GEMINI_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           GEMINI_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
-          GITHUB_STEP_SUMMARY: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} # Pass summary file path
+          GITHUB_STEP_SUMMARY: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
         run: python engine.py

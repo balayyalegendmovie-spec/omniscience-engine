@@ -4,8 +4,8 @@ import random
 import requests
 import socket
 import urllib3
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -25,15 +25,26 @@ CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'aws
 SENSITIVE_PATHS = [
     '/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php',
     '/phpinfo.php', '/admin', '/admin/login', '/robots.txt', '/sitemap.xml',
-    '/server-status', '/server-info', '/.htaccess', '/config.yml', '/package.json',
-    '/.DS_Store', '/backup.sql', '/database.sql', '/.well-known/security.txt'
+    '/server-status', '/.htaccess', '/config.yml', '/package.json',
+    '/.DS_Store', '/backup.sql', '/.well-known/security.txt'
 ]
+
+# NEW: Advanced Vulnerability Endpoints
+ADVANCED_ENDPOINTS = [
+    '/api/v1', '/api/v2', '/api/docs', '/swagger-ui.html', '/swagger.json', 
+    '/openapi.json', '/graphql', '/graphiql', '/actuator/health', '/actuator/env',
+    '/actuator/trace', '/wp-json/wp/v2/users', '/?rest_route=/wp/v2/users',
+    '/console', '/debug', '/trace', '/.well-known/openid-configuration',
+    '/api/users', '/api/admin', '/telemetry', '/metrics'
+]
+
+# NEW: Parameters often vulnerable to Open Redirect / SSRF / LFI
+REDIRECT_PARAMS = ['url', 'redirect', 'next', 'continue', 'return', 'dest', 'target', 'redir', 'rurl']
 
 SECURITY_HEADERS = [
     'Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy',
     'X-Content-Type-Options', 'Referrer-Policy', 'Permissions-Policy',
-    'X-XSS-Protection', 'Feature-Policy', 'Cross-Origin-Opener-Policy',
-    'Cross-Origin-Resource-Policy', 'Expect-CT'
+    'X-XSS-Protection', 'Feature-Policy', 'Cross-Origin-Opener-Policy'
 ]
 
 # ==========================================
@@ -71,7 +82,7 @@ def probe_subdomain(sub):
         "host": sub, "ip": None, "is_cdn": False, "cdn_provider": None,
         "http_status": None, "title": None, "server": None, 
         "technologies": [], "missing_headers": [], "cookie_issues": [],
-        "sensitive_files": []
+        "sensitive_files": [], "hidden_api_endpoints": [], "html_size": 0
     }
     
     ip = resolve_dns(sub)
@@ -100,17 +111,21 @@ def probe_subdomain(sub):
             if "wordpress" in r.text.lower()[:2000]: techs.append("WordPress Detected")
             result["technologies"] = techs
             
-            # Security Headers Check
             missing = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
             result["missing_headers"] = missing
             
-            # Cookie Security Check
             bad_cookies = []
             for cookie in r.cookies:
                 if not cookie.secure: bad_cookies.append(f"Cookie '{cookie.name}' missing Secure flag")
                 if not cookie.has_nonstandard_attr('httponly'): bad_cookies.append(f"Cookie '{cookie.name}' missing HttpOnly")
             result["cookie_issues"] = bad_cookies
-            
+
+            # NEW: Extract hidden endpoints from JavaScript/HTML
+            api_patterns = re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin|user|upload)/[^"\']*)(?:["\'])', r.text)
+            if api_patterns:
+                result["hidden_api_endpoints"] = list(set(api_patterns))[:10] # Top 10 unique
+                
+            result["html_size"] = len(r.content)
             break
         except: continue
     return result
@@ -133,39 +148,78 @@ def stage_1_recon(target):
     return alive_assets
 
 # ==========================================
-# STAGE 2: WEB FUZZING (OWASP Misconfigs)
+# STAGE 2: ADVANCED VULNERABILITY AUDIT
 # ==========================================
-def check_sensitive_path(base_url, path):
+def check_path(base_url, path):
     try:
         r = requests.get(f"{base_url}{path}", timeout=4, verify=False, allow_redirects=False)
-        if r.status_code in [200, 403, 401]: # 403/401 means it exists but is protected
-            return {"path": path, "status": r.status_code}
+        if r.status_code in [200, 403, 401, 405]:
+            return {"path": path, "status": r.status_code, "size": len(r.content)}
         return None
     except: return None
 
+def check_open_redirect(base_url, param):
+    try:
+        payload = f"https://evil.com"
+        r = requests.get(f"{base_url}/?{param}={payload}", timeout=4, verify=False, allow_redirects=False)
+        # Check if it redirects to our evil payload
+        if r.status_code in [301, 302, 303, 307, 308]:
+            location = r.headers.get('Location', '')
+            if "evil.com" in location:
+                return {"parameter": param, "redirect_url": location}
+        return None
+    except: return None
+
+def check_error_leaks(base_url):
+    leaks = []
+    payloads = ["'", "{{7*7}}", "<h1>xss</h1>"]
+    try:
+        for p in payloads:
+            r = requests.get(f"{base_url}/?id={p}", timeout=4, verify=False)
+            text = r.text.lower()
+            if "sql syntax" in text or "mysql_" in text or "pgsql" in text:
+                leaks.append({"type": "SQL Error Leak", "payload": p})
+            elif "49" in r.text and p == "{{7*7}}": # 7*7 = 49
+                leaks.append({"type": "SSTI Detected (49)", "payload": p})
+            elif "<h1>xss</h1>" in text.lower():
+                leaks.append({"type": "Reflected XSS (No Filter)", "payload": p})
+            if leaks: break # One leak is enough to prove the point
+    except: pass
+    return leaks
+
 def stage_2_web_audit(assets):
-    print(f"[+] Starting Web Security Audit (Fuzzing & Headers)...")
+    print(f"[+] Starting Advanced Vulnerability Audit...")
     
     for asset in assets:
-        if not asset["http_status"]: continue # Only audit web-active hosts
+        if not asset["http_status"]: continue
+        base_url = f"https://{asset['host']}"
         
-        scheme = "https" if "443" in str(asset.get("ip", "")) or asset.get("http_status") else "http"
-        base_url = f"https://{asset['host']}" # Try https first
-        
-        # Fuzz sensitive paths
+        # 1. Fuzz Sensitive Files + Advanced API Endpoints
+        all_paths = SENSITIVE_PATHS + ADVANCED_ENDPOINTS
         found_files = []
         with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(check_sensitive_path, base_url, path): path for path in SENSITIVE_PATHS}
+            futures = {executor.submit(check_path, base_url, path): path for path in all_paths}
             for future in as_completed(futures):
                 res = future.result()
-                if res:
-                    found_files.append(res)
-        
+                if res: found_files.append(res)
         asset["sensitive_files"] = found_files
-        if found_files:
-            print(f"  -> {asset['host']}: Found {len(found_files)} interesting paths (e.g., {found_files[0]['path']}).")
+        
+        # 2. Open Redirect Checks
+        open_redirects = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(check_open_redirect, base_url, param): param for param in REDIRECT_PARAMS}
+            for future in as_completed(futures):
+                res = future.result()
+                if res: open_redirects.append(res)
+        asset["open_redirects"] = open_redirects
+        
+        # 3. Error/Leak Provocation
+        asset["data_leaks"] = check_error_leaks(base_url)
+        
+        if found_files or open_redirects or asset["data_leaks"]:
+            print(f"  -> {asset['host']}: Vulns found! {len(found_files)} endpoints, {len(open_redirects)} redirects, {len(asset['data_leaks'])} leaks.")
     
-    print(f"[+] Web Audit Complete.")
+    print(f"[+] Advanced Audit Complete.")
     return assets
 
 # ==========================================
@@ -183,9 +237,7 @@ def scan_port(ip, port):
 def stage_3_network_scan(assets):
     origin_assets = [a for a in assets if not a["is_cdn"]]
     cdn_assets = [a for a in assets if a["is_cdn"]]
-    
     print(f"[+] {len(origin_assets)} Origin assets. Scanning top ports...")
-    
     for asset in origin_assets:
         ip = asset["ip"]
         open_ports = []
@@ -195,13 +247,11 @@ def stage_3_network_scan(assets):
                 port = future.result()
                 if port: open_ports.append(port)
         asset["open_ports"] = sorted(open_ports) if open_ports else []
-        if open_ports: print(f"  -> {asset['host']} ({ip}): Ports {open_ports}")
-
-    for a in cdn_assets: a["open_ports"] = ["CDN Protected - Not Scanned"]
+    for a in cdn_assets: a["open_ports"] = ["CDN Protected"]
     return origin_assets + cdn_assets
 
 # ==========================================
-# AI STAGES (Strict Evidence Only)
+# AI STAGES (How & Why Analysis)
 # ==========================================
 def call_gemini(prompt, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
@@ -222,46 +272,48 @@ def call_gemini_with_retry(prompt):
     raise Exception("All API keys exhausted.")
 
 def stage_4_ai_analysis(data):
-    print("[+] Running AI Stage 1: Evidence Extraction...")
-    prompt = f"""You are an expert, strict, evidence-only Threat Intelligence Analyst. Analyze this raw scan data for '{TARGET}':
+    print("[+] Running AI Stage 1: Vulnerability Evidence Extraction...")
+    prompt = f"""You are a Tier-1 Red Team Operator. Analyze this raw scan data for '{TARGET}':
     {json.dumps(data, indent=2)}
     
     STRICT RULES:
-    1. DO NOT GUESS technologies or vulnerabilities.
-    2. Treat exposed sensitive files (.git/HEAD, .env, phpinfo.php, wp-login.php, admin panels, etc.) as security findings.
-    3. Treat missing security headers as informational findings.
-    4. Flag insecure cookies (missing Secure/HttpOnly) as vulnerabilities.
-    5. ONLY flag open ports that are actually in the "open_ports" array.
-    6. Map ONLY proven risks to MITRE ATT&CK and OWASP Top 10 (2021).
+    1. DO NOT GUESS. Base everything on the provided evidence.
+    2. For EVERY finding, you MUST provide:
+       - **what_was_found**: The exact URL/Port/Header.
+       - **why_its_vulnerable**: The technical flaw (e.g., "Server blindly redirects to attacker-controlled URL without validation").
+       - **how_to_exploit**: Brief scenario (e.g., "Attacker sends link to user; user clicks and is redirected to a fake login page to steal credentials").
+    3. Flag exposed API docs (/swagger, /graphql, /openapi) as HIGH severity.
+    4. Flag Open Redirects as MEDIUM/HIGH.
+    5. Flag SQL/SSTI/XSS error leaks as CRITICAL/HIGH.
     
     Output strictly as JSON array:
     [
         {{
             "asset": "subdomain.target.com",
-            "ip": "x.x.x.x",
-            "finding": "Exact description of what was found",
+            "what_was_found": "e.g., /swagger-ui.html returned 200",
+            "why_its_vulnerable": "e.g., Exposes API schema allowing attackers to understand internal logic.",
+            "how_to_exploit": "e.g., Attacker reads schema -> crafts valid API request to /api/admin/delete",
             "severity": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
-            "mitre_tactic": "Tactic (TA####)",
-            "mitre_technique": "Technique (T####)",
-            "owasp_category": "A01:2021 - Broken Access Control (if applicable)",
-            "evidence": "Exact proof from the data")
+            "owasp_category": "e.g., A01:2021 - Broken Access Control",
+            "mitre_technique": "e.g., T1190"
         }}
     ]"""
     return call_gemini_with_retry(prompt)
 
 def stage_5_ai_report(intel):
-    print("[+] Running AI Stage 2: Final Report...")
-    prompt = f"""You are a CISO reporting assistant. Take this evidence-based intelligence for '{TARGET}':
+    print("[+] Running AI Stage 2: Final Report Generation...")
+    prompt = f"""You are a CISO reporting assistant. Take this red team intelligence for '{TARGET}':
     {intel}
     
-    Write a professional Markdown report. Base EVERY statement on the provided evidence.
-    
-    Include:
-    1. 🎯 **Executive Summary:** (Risk score out of 100)
-    2. 🗺️ **Attack Surface Map:** Differentiate between CDN-protected and Origin assets.
-    3. 🚨 **Critical Findings:** Exposed files, EOL tech, open admin ports.
-    4. 🛡️ **OWASP & MITRE Mapping:** Group findings strictly by OWASP Top 10 and MITRE ATT&CK.
-    5. 🔧 **Remediation Steps:** Actionable advice based strictly on what was found."""
+    Write a highly detailed, professional Markdown report. Include:
+    1. 🎯 **Executive Summary:** (Risk score out of 100, overview of real threats).
+    2. 🗺️ **Attack Surface Map:** Summary of assets, CDN protection, and exposed ports.
+    3. 🚨 **Vulnerable Endpoints & Exploitability:** Group by severity. For each, explain:
+       - **What was found**
+       - **Why it is vulnerable** 
+       - **How an attacker exploits it**
+    4. 🛡️ **OWASP & MITRE Mapping:** Group findings.
+    5. 🔧 **Remediation Steps:** Specific, actionable fixes."""
     return call_gemini_with_retry(intel)
 
 # ==========================================
@@ -275,27 +327,18 @@ def stage_6_deliver(report):
 
 if __name__ == "__main__":
     print(f"=== OMNISCIENCE ENGINE STARTED ===")
-    
-    # Stage 1: Subdomains & Web Info
     assets = stage_1_recon(TARGET)
-    
-    # Stage 2: Web Security Audit (Fuzzing + Headers + Cookies)
     assets = stage_2_web_audit(assets)
-    
-    # Stage 3: Network Origin Port Scan
     full_data = stage_3_network_scan(assets)
     
     with open('./cache/raw_data.json', 'w') as f:
         json.dump({"target": TARGET, "assets": full_data}, f, indent=2)
     
-    # Stage 4: AI Analysis
     intel = stage_4_ai_analysis(full_data)
     with open('./cache/processed_intel.json', 'w') as f: f.write(intel)
         
-    # Stage 5: AI Report
     report = stage_5_ai_report(intel)
     with open('./cache/final_report.md', 'w') as f: f.write(report)
         
-    # Stage 6: Delivery
     stage_6_deliver(report)
     print(f"=== OMNISCIENCE ENGINE COMPLETE ===")

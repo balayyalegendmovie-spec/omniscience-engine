@@ -20,6 +20,9 @@ API_KEYS = [
     os.environ.get('GEMINI_KEY_5'), os.environ.get('GEMINI_KEY_6')
 ]
 
+# SELF-LEARNING MEMORY: Load False Positives
+FALSE_PATTERNS = [p.strip().upper() for p in os.environ.get('FALSE_PATTERNS', '').split(',') if p.strip()]
+
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
 CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'awselb', 'fastly']
 
@@ -125,19 +128,14 @@ def stage_1_recon(target):
     return alive_assets
 
 # ==========================================
-# STAGE 1.5: DEEP OSINT (NEW!)
+# STAGE 1.5: DEEP OSINT
 # ==========================================
 def github_secret_dorking(target):
-    """Search GitHub for hardcoded secrets belonging to the target"""
     print(f"[+] Running GitHub OSINT for {target}...")
     queries = [
-        f'"{target}" password',
-        f'"{target}" api_key',
-        f'"{target}" .env',
-        f'"{target}" secret_key',
-        f'"{target}" connection_string'
+        f'"{target}" password', f'"{target}" api_key', f'"{target}" .env',
+        f'"{target}" secret_key', f'"{target}" connection_string'
     ]
-    
     leaked_data = []
     for query in queries:
         try:
@@ -152,39 +150,31 @@ def github_secret_dorking(target):
                 if data.get("total_count", 0) > 0:
                     for item in data.get("items", []):
                         leaked_data.append({
-                            "file": item.get("path"),
-                            "repo": item.get("repository", {}).get("full_name"),
-                            "url": item.get("html_url"),
-                            "query_used": query
+                            "file": item.get("path"), "repo": item.get("repository", {}).get("full_name"),
+                            "url": item.get("html_url"), "query_used": query
                         })
-            time.sleep(3)  # Respect GitHub unauthenticated rate limits (10 req/min)
+            time.sleep(3)
         except: pass
-    
     if leaked_data: print(f"[+] WARNING: Found {len(leaked_data)} potential code leaks on GitHub!")
-    else: print(f"[+] GitHub OSINT clean. No obvious leaks found.")
+    else: print(f"[+] GitHub OSINT clean.")
     return leaked_data
 
 def discover_cloud_assets(target):
-    """Check for publicly exposed S3, Firebase, and GCS buckets"""
     print(f"[+] Probing Cloud Assets for {target}...")
     org_name = target.split('.')[0]
-    
     permutations = [
         f"{org_name}-backup", f"{org_name}-dev", f"{org_name}-staging",
         f"{org_name}-old", f"{org_name}-bucket", f"{target.replace('.', '-')}",
         f"{target}-logs", f"{org_name}-assets", f"{org_name}-data"
     ]
-    
     exposed_assets = []
     
     def check_s3(perm):
         url = f"http://{perm}.s3.amazonaws.com"
         try:
             r = requests.get(url, timeout=4)
-            if r.status_code == 200:
-                return {"type": "AWS S3 (PUBLIC READ)", "url": url, "severity": "CRITICAL", "evidence": "Bucket contents listable"}
-            elif r.status_code == 403:
-                return {"type": "AWS S3 (EXISTS)", "url": url, "severity": "INFO", "evidence": "Bucket exists but access denied"}
+            if r.status_code == 200: return {"type": "AWS S3 (PUBLIC READ)", "url": url, "severity": "CRITICAL"}
+            elif r.status_code == 403: return {"type": "AWS S3 (EXISTS)", "url": url, "severity": "INFO"}
         except: pass
         return None
 
@@ -192,15 +182,13 @@ def discover_cloud_assets(target):
         url = f"https://{perm}.firebaseio.com/.json"
         try:
             r = requests.get(url, timeout=4)
-            if r.status_code == 200 and r.text != "null":
-                return {"type": "Firebase DB (PUBLIC)", "url": url, "severity": "CRITICAL", "evidence": "Database readable"}
+            if r.status_code == 200 and r.text != "null": return {"type": "Firebase DB (PUBLIC)", "url": url, "severity": "CRITICAL"}
         except: pass
         return None
 
     with ThreadPoolExecutor(max_workers=15) as executor:
         s3_futures = {executor.submit(check_s3, p): p for p in permutations}
         fb_futures = {executor.submit(check_firebase, p): p for p in permutations}
-        
         for future in as_completed(s3_futures):
             res = future.result()
             if res: exposed_assets.append(res)
@@ -213,11 +201,7 @@ def discover_cloud_assets(target):
     return exposed_assets
 
 def stage_1_5_osint(target):
-    """Run all passive OSINT checks"""
-    return {
-        "github_leaks": github_secret_dorking(target),
-        "cloud_assets": discover_cloud_assets(target)
-    }
+    return { "github_leaks": github_secret_dorking(target), "cloud_assets": discover_cloud_assets(target) }
 
 # ==========================================
 # STAGE 2: WEB AUDIT
@@ -225,8 +209,7 @@ def stage_1_5_osint(target):
 def check_path(base_url, path):
     try:
         r = requests.get(f"{base_url}{path}", timeout=4, verify=False, allow_redirects=False)
-        if r.status_code in [200, 403, 401, 405]:
-            return {"path": path, "status": r.status_code, "size": len(r.content)}
+        if r.status_code in [200, 403, 401, 405]: return {"path": path, "status": r.status_code, "size": len(r.content)}
     except: pass
     return None
 
@@ -304,6 +287,31 @@ def stage_3_network_scan(assets):
     return origin_assets + cdn_assets
 
 # ==========================================
+# STAGE 3.5: SELF-LEARNING FILTER (Phase 8)
+# ==========================================
+def apply_memory_filter(assets):
+    if not FALSE_PATTERNS: return assets
+    print(f"[+] Memory Filter active. Ignoring patterns: {FALSE_PATTERNS}")
+    
+    for asset in assets:
+        # Filter sensitive files
+        asset["sensitive_files"] = [
+            f for f in asset.get("sensitive_files", [])
+            if not any(fp in json.dumps(f).upper() for fp in FALSE_PATTERNS)
+        ]
+        # Filter data leaks (e.g., fake SSTI)
+        asset["data_leaks"] = [
+            l for l in asset.get("data_leaks", [])
+            if not any(fp in json.dumps(l).upper() for fp in FALSE_PATTERNS)
+        ]
+        # Filter open redirects
+        asset["open_redirects"] = [
+            r for r in asset.get("open_redirects", [])
+            if not any(fp in json.dumps(r).upper() for fp in FALSE_PATTERNS)
+        ]
+    return assets
+
+# ==========================================
 # AI STAGES
 # ==========================================
 def call_gemini(prompt, api_key):
@@ -336,7 +344,7 @@ def stage_4_ai_analysis(data, osint_data):
     
     STRICT RULES:
     1. DO NOT GUESS. Base everything on the provided evidence.
-    2. If GitHub leaks are found, treat them as CRITICAL. Explain exactly what was leaked (e.g., "Hardcoded database credentials found in .env file").
+    2. If GitHub leaks are found, treat them as CRITICAL.
     3. If public Cloud assets (S3/Firebase) are found, treat them as CRITICAL.
     4. For web findings, explain What, Why, and How to exploit.
     5. Map ONLY proven risks to MITRE ATT&CK and OWASP Top 10.
@@ -362,7 +370,7 @@ def stage_5_ai_report(intel):
     
     Write a highly detailed, professional Markdown report. Include:
     1. 🎯 **Executive Summary:** (Risk score out of 100, highlight OSINT/Leaks immediately).
-    2. ☣️ **OSINT & Leaks (CRITICAL):** Detail any GitHub code leaks or exposed Cloud buckets first. These are the highest priority.
+    2. ☣️ **OSINT & Leaks (CRITICAL):** Detail any GitHub code leaks or exposed Cloud buckets first.
     3. 🗺️ **Attack Surface Map:** Web assets, CDN protection, open ports.
     4. 🚨 **Vulnerable Endpoints:** Web misconfigurations, API exposures, Open Redirects.
     5. 🛡️ **OWASP & MITRE Mapping:** Group findings.
@@ -379,31 +387,24 @@ def stage_6_deliver(report):
     except Exception as e: print(f"[-] Failed: {e}")
 
 if __name__ == "__main__":
-    print(f"=== OMNISCIENCE ENGINE v2.0 STARTED ===")
+    print(f"=== OMNISCIENCE ENGINE v2.1 (Self-Learning) STARTED ===")
     
-    # Stage 1: Web & Subdomain Recon
     assets = stage_1_recon(TARGET)
-    
-    # Stage 1.5: Passive OSINT (GitHub Leaks + Cloud Assets)
     osint_data = stage_1_5_osint(TARGET)
-    
-    # Stage 2: Web Security Audit
     assets = stage_2_web_audit(assets)
-    
-    # Stage 3: Network Origin Port Scan
     full_data = stage_3_network_scan(assets)
+    
+    # Apply Self-Learning Filter
+    full_data = apply_memory_filter(full_data)
     
     with open('./cache/raw_data.json', 'w') as f:
         json.dump({"target": TARGET, "assets": full_data, "osint": osint_data}, f, indent=2)
     
-    # Stage 4: AI Analysis (Now includes OSINT data!)
     intel = stage_4_ai_analysis(full_data, osint_data)
     with open('./cache/processed_intel.json', 'w') as f: f.write(intel)
         
-    # Stage 5: AI Report
     report = stage_5_ai_report(intel)
     with open('./cache/final_report.md', 'w') as f: f.write(report)
         
-    # Stage 6: Delivery
     stage_6_deliver(report)
     print(f"=== OMNISCIENCE ENGINE COMPLETE ===")

@@ -255,9 +255,9 @@ def stage_2_web_audit(assets):
         a["data_leaks"] = check_error_leaks(b)
         total_leaks += len(a["data_leaks"])
         
-    log_summary(f- "Exposed Paths: **{total_paths}**")
-    log_summary(f- "Open Redirects: **{total_redirs}**")
-    log_summary(f- "Error/Injection Leaks: **{total_leaks}**")
+    log_summary(f "Exposed Paths: **{total_paths}**")
+    log_summary(f "Open Redirects: **{total_redirs}**")
+    log_summary(f "Error/Injection Leaks: **{total_leaks}**")
     return assets
 
 # ==========================================

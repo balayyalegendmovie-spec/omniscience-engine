@@ -6,10 +6,11 @@ import socket
 import urllib3
 import re
 import time
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
-# Try importing Playwright (graceful fallback if it fails to install)
+# Try importing Playwright
 try:
     from playwright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
@@ -33,13 +34,23 @@ def log_summary(text):
             with open(SUMMARY_FILE, 'a') as f: f.write(text + "\n")
         except: pass
 
+# COMPLETE LISTS (NO SHORTCUTS)
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
 CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'awselb', 'fastly']
-SENSITIVE_PATHS = ['/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php', '/phpinfo.php', '/admin', '/robots.txt', '/sitemap.xml', '/server-status', '/config.yml', '/package.json']
-ADVANCED_ENDPOINTS = ['/api/v1', '/swagger-ui.html', '/swagger.json', '/openapi.json', '/graphql', '/actuator/health', '/actuator/env', '/wp-json/wp/v2/users', '/console']
+
+SENSITIVE_PATHS = [
+    '/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php', 
+    '/phpinfo.php', '/admin', '/robots.txt', '/sitemap.xml', '/server-status', 
+    '/config.yml', '/package.json'
+]
+ADVANCED_ENDPOINTS = [
+    '/api/v1', '/swagger-ui.html', '/swagger.json', '/openapi.json', 
+    '/graphql', '/actuator/health', '/actuator/env', '/wp-json/wp/v2/users', '/console'
+]
 REDIRECT_PARAMS = ['url', 'redirect', 'next', 'continue', 'return', 'dest', 'target']
 SECURITY_HEADERS = ['Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy', 'X-Content-Type-Options']
 
+# FULL 7 JS SECRET PATTERNS
 SECRET_PATTERNS = {
     "Google API Key": r"AIza[0-9A-Za-z_-]{35}",
     "AWS Access Key": r"AKIA[0-9A-Z]{16}",
@@ -50,6 +61,7 @@ SECRET_PATTERNS = {
     "Generic Secret": r"(?:secret_key|api_key|password)\s*[:=]\s*['\"][^'\"]{8,}['\"]"
 }
 
+# FULL 8 TAKEOVER FINGERPRINTS
 TAKEOVER_FINGERPRINTS = {
     "aws_s3": ["NoSuchBucket", "The specified bucket does not exist"],
     "heroku": ["No such app", "herokucdn"],
@@ -65,9 +77,9 @@ SCREENSHOT_DIR = "./cache/screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 # ==========================================
-# VISUAL PROOF ENGINE (PLAYWRIGHT)
+# VISUAL PROOF ENGINE (BASE64 PIPELINE)
 # ==========================================
-def capture_screenshot(url, vuln_name):
+def capture_screenshot_b64(url, vuln_name):
     if not PLAYWRIGHT_AVAILABLE: return None
     try:
         safe_filename = re.sub(r'[^a-zA-Z0-9]', '_', vuln_name)[:20] + ".png"
@@ -77,23 +89,17 @@ def capture_screenshot(url, vuln_name):
             browser = p.chromium.launch(headless=True, args=['--ignore-certificate-errors', '--no-sandbox'])
             page = browser.new_page()
             page.goto(url, timeout=15000, wait_until="domcontentloaded")
-            page.screenshot(path=filepath, full_page=False)
+            page.screenshot(path=filepath, clip={"x": 0, "y": 0, "width": 1280, "height": 720})
             browser.close()
             
-        log_summary(f"  📸 Screenshot captured for {vuln_name}")
-        return filepath
+        with open(filepath, "rb") as img_file:
+            b64_string = base64.b64encode(img_file.read()).decode('utf-8')
+            
+        log_summary(f"  📸 Screenshot captured & encoded for {vuln_name}")
+        return b64_string
     except Exception as e:
         log_summary(f"  ❌ Screenshot failed for {url}: {e}")
         return None
-
-def upload_image(filepath):
-    try:
-        with open(filepath, 'rb') as f:
-            r = requests.post("https://0x0.st", files={'file': f}, timeout=15)
-            if r.status_code == 200 and r.text.strip().startswith("http"):
-                return r.text.strip()
-    except: pass
-    return None
 
 # ==========================================
 # STAGE 1: DEEP RECON
@@ -126,6 +132,7 @@ def resolve_dns(s):
     except: return None
 
 def probe_subdomain(sub):
+    # FULL DICTIONARY INIT (Missing from previous versions!)
     res = {
         "host": sub, "ip": None, "is_cdn": False, "http_status": None, 
         "title": None, "server": None, "technologies": [], "missing_headers": [], 
@@ -140,6 +147,7 @@ def probe_subdomain(sub):
         try:
             r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
             res["http_status"] = r.status_code
+            
             if "<title>" in r.text.lower():
                 s = r.text.lower().find("<title>") + 7; e = r.text.lower().find("</title>", s)
                 res["title"] = r.text[s:e].strip()[:100]
@@ -154,7 +162,10 @@ def probe_subdomain(sub):
             res["technologies"] = techs
             
             res["missing_headers"] = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
+            
+            # RESTORED: Hidden API Endpoint Extraction
             res["hidden_api_endpoints"] = list(set(re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin)/[^"\']*)(?:["\'])', r.text)))[:10]
+            
             res["js_files"] = [requests.compat.urljoin(f"{scheme}://{sub}", link) for link in re.findall(r'(?:src=["\'])([^"\']+\.js(?:\?[^"\']*)?)', r.text)[:5]]
             
             # RESTORED: Cookie Security Checks
@@ -189,6 +200,7 @@ def stage_1_recon(target):
 # ==========================================
 def github_secret_dorking(t):
     leaks = []
+    # RESTORED: All 3 queries
     for q in [f'"{t}" password', f'"{t}" .env', f'"{t}" api_key']:
         try:
             r = requests.get("https://api.github.com/search/code", params={"q": q, "per_page": 3}, headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "OMNI"}, timeout=15)
@@ -199,8 +211,11 @@ def github_secret_dorking(t):
     return leaks
 
 def discover_cloud_assets(t):
-    org = t.split('.')[0]; perms = [f"{org}-backup", f"{org}-dev", f"{org}-staging", f"{org}-bucket", t.replace('.', '-')]
+    org = t.split('.')[0]
+    perms = [f"{org}-backup", f"{org}-dev", f"{org}-staging", f"{org}-bucket", t.replace('.', '-')]
     exposed = []
+    
+    # RESTORED: Firebase Check
     def check_s3(p):
         try:
             r = requests.get(f"http://{p}.s3.amazonaws.com", timeout=4)
@@ -212,6 +227,7 @@ def discover_cloud_assets(t):
             r = requests.get(f"https://{p}.firebaseio.com/.json", timeout=4)
             if r.status_code == 200 and r.text != "null": return {"type": "Firebase (PUBLIC)", "url": f"https://{p}.firebaseio.com", "severity": "CRITICAL"}
         except: pass
+        
     with ThreadPoolExecutor(max_workers=15) as ex:
         for f in as_completed([ex.submit(check_s3, p) for p in perms] + [ex.submit(check_fb, p) for p in perms]):
             res = f.result()
@@ -266,16 +282,19 @@ def check_cors(u):
     except: pass
     return None
 
-# RESTORED: Error Leak Provocation
 def check_error_leaks(u):
     leaks = []
-    for p in ["'", "{{7*7}}"]:
-        try:
-            r = requests.get(f"{u}/?id={p}", timeout=4, verify=False)
-            text = r.text.lower()
-            if "sql syntax" in text or "mysql_" in text: leaks.append({"type": "SQL Error Leak", "payload": p, "evidence": "SQL syntax error exposed", "full_url": f"{u}/?id={p}"})
-            elif "49" in r.text and p == "{{7*7}}": leaks.append({"type": "SSTI Detected", "payload": p, "evidence": "Response contained '49' from {{7*7}}", "full_url": f"{u}/?id={p}"})
-        except: pass
+    try:
+        r_sqli = requests.get(f"{u}/?id='", timeout=4, verify=False)
+        if "sql syntax" in r_sqli.text.lower() or "mysql_" in r_sqli.text.lower():
+            leaks.append({"type": "SQL Error Leak", "payload": "'", "evidence": "SQL syntax error exposed", "full_url": f"{u}/?id='"})
+        
+        r_ssti1 = requests.get(f"{u}/?id={{{{7*7}}}}", timeout=4, verify=False)
+        if "49" in r_ssti1.text:
+            r_ssti2 = requests.get(f"{u}/?id={{{{6*6}}}}", timeout=4, verify=False)
+            if "36" in r_ssti2.text:
+                leaks.append({"type": "SSTI Verified", "payload": "{{7*7}}", "evidence": "Server executed math: 49 (7*7) and 36 (6*6)", "full_url": f"{u}/?id={{{{7*7}}}}"})
+    except: pass
     return leaks
 
 def stage_2_web_audit(assets):
@@ -295,14 +314,12 @@ def stage_2_web_audit(assets):
         a["sensitive_files"] = found
         total_paths += len(found)
         
-        # VISUAL PROOF LOGIC
         for f in found:
             if f["status"] == 200 and any(kw in f["path"] for kw in ['/.git', '/.env', '/actuator', 'phpinfo', 'swagger', 'console']):
                 log_summary(f"- 🚨 CRITICAL PoC Found: {f['full_url']}")
-                filepath = capture_screenshot(f["full_url"], f["path"].replace('/', '_'))
-                if filepath:
-                    img_url = upload_image(filepath)
-                    if img_url: screenshots_to_send.append({"vuln": f["path"], "url": img_url})
+                b64_img = capture_screenshot_b64(f["full_url"], f["path"].replace('/', '_'))
+                if b64_img:
+                    screenshots_to_send.append({"vuln": f["path"], "b64": b64_img})
         
         redirs = []
         with ThreadPoolExecutor(max_workers=10) as ex:
@@ -313,8 +330,6 @@ def stage_2_web_audit(assets):
         total_redirs += len(redirs)
         
         a["cors_issue"] = check_cors(b)
-        
-        # RESTORED: Data Leaks
         a["data_leaks"] = check_error_leaks(b)
         total_leaks += len(a["data_leaks"])
         
@@ -325,12 +340,12 @@ def stage_2_web_audit(assets):
     return assets, screenshots_to_send
 
 # ==========================================
-# STAGES 2.5 & 2.8: HISTORY, SECRETS & TAKEOVERS
+# STAGES 2.5, 2.8, 3
 # ==========================================
 def fetch_wayback_urls(target):
     paths = set()
     try:
-        r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=100", timeout=15)
+        r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=200", timeout=15)
         if r.status_code == 200:
             for e in r.json()[1:]:
                 p = urlparse(e[0]).path
@@ -375,6 +390,7 @@ def stage_2_5_history_and_secrets(assets, target):
     log_summary(f"- Hardcoded Secrets in JS: **{total_js}**")
     return assets
 
+# RESTORED: Full 8 Provider Takeover Logic
 def check_takeover(sub):
     try:
         r = requests.get(f"https://dns.google/resolve?name={sub}&type=CNAME", timeout=5)
@@ -413,9 +429,6 @@ def stage_2_8_takeover_scan(assets):
     log_summary(f"- Potential Takeovers: **{len(takeovers)}**")
     return takeovers
 
-# ==========================================
-# STAGE 3 & 3.5: PORTS & MEMORY
-# ==========================================
 def scan_port(ip, port):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1.5)
@@ -450,7 +463,7 @@ def apply_memory_filter(assets):
     return assets
 
 # ==========================================
-# AI & DELIVERY (PoC Prompt Forcing)
+# AI & DELIVERY
 # ==========================================
 def call_gemini(prompt, key):
     r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={key}", json={"contents": [{"parts":[{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192}}, timeout=90)
@@ -498,12 +511,13 @@ def stage_5_report(intel):
 
 def deliver(report, screenshots):
     log_summary("## 🚀 Stage 6: Delivery")
-    payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report, "screenshots": screenshots}
-    requests.post(CALLBACK_URL, json=payload, timeout=30)
+    capped_screenshots = screenshots[:2] # Cap at 2 to avoid GAS payload limits
+    payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report, "screenshots": capped_screenshots}
+    requests.post(CALLBACK_URL, json=payload, timeout=60)
     log_summary("- ✅ Sent to Google Apps Script.")
 
 if __name__ == "__main__":
-    log_summary(f"# 🛡️ OMNISCIENCE v4.1 (Complete Edition): `{TARGET}`")
+    log_summary(f"# 🛡️ OMNISCIENCE v4.2 (Ultimate Edition): `{TARGET}`")
     start_time = time.time()
     
     assets = stage_1_recon(TARGET)

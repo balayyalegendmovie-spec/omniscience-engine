@@ -17,9 +17,16 @@ on:
         required: false
         default: ""
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Fixes Node 20 deprecation warning
+
 jobs:
   scan-and-analyze:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      actions: write # Required for Job Summaries
     
     steps:
       - name: Checkout Code
@@ -48,4 +55,5 @@ jobs:
           GEMINI_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           GEMINI_KEY_5: ${{ secrets.GEMINI_API_KEY_5 }}
           GEMINI_KEY_6: ${{ secrets.GEMINI_API_KEY_6 }}
+          GITHUB_STEP_SUMMARY: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} # Pass summary file path
         run: python engine.py

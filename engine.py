@@ -7,404 +7,328 @@ import urllib3
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TARGET = os.environ.get('TARGET')
 CHAT_ID = os.environ.get('CHAT_ID')
 CALLBACK_URL = os.environ.get('CALLBACK_URL')
-
-API_KEYS = [
-    os.environ.get('GEMINI_KEY_1'), os.environ.get('GEMINI_KEY_2'),
-    os.environ.get('GEMINI_KEY_3'), os.environ.get('GEMINI_KEY_4'),
-    os.environ.get('GEMINI_KEY_5'), os.environ.get('GEMINI_KEY_6')
-]
-
-# SELF-LEARNING MEMORY: Load False Positives
+API_KEYS = [os.environ.get(f'GEMINI_KEY_{i}') for i in range(1, 7)]
 FALSE_PATTERNS = [p.strip().upper() for p in os.environ.get('FALSE_PATTERNS', '').split(',') if p.strip()]
 
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
 CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'awselb', 'fastly']
-
-SENSITIVE_PATHS = [
-    '/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php',
-    '/phpinfo.php', '/admin', '/admin/login', '/robots.txt', '/sitemap.xml',
-    '/server-status', '/.htaccess', '/config.yml', '/package.json', '/.DS_Store'
-]
-
-ADVANCED_ENDPOINTS = [
-    '/api/v1', '/swagger-ui.html', '/swagger.json', '/openapi.json', 
-    '/graphql', '/actuator/health', '/actuator/env',
-    '/wp-json/wp/v2/users', '/console', '/debug'
-]
-
+SENSITIVE_PATHS = ['/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php', '/phpinfo.php', '/admin', '/robots.txt', '/sitemap.xml', '/server-status', '/config.yml', '/package.json']
+ADVANCED_ENDPOINTS = ['/api/v1', '/swagger-ui.html', '/swagger.json', '/openapi.json', '/graphql', '/actuator/health', '/actuator/env', '/wp-json/wp/v2/users', '/console']
 REDIRECT_PARAMS = ['url', 'redirect', 'next', 'continue', 'return', 'dest', 'target']
 SECURITY_HEADERS = ['Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy', 'X-Content-Type-Options']
+
+# Regex for Hardcoded Secrets in JS
+SECRET_PATTERNS = {
+    "Google API Key": r"AIza[0-9A-Za-z_-]{35}",
+    "AWS Access Key": r"AKIA[0-9A-Z]{16}",
+    "Slack Token": r"xox[baprs]-[0-9a-zA-Z-]{10,}",
+    "GitHub Token": r"gh[pousr]_[A-Za-z0-9_]{36,}",
+    "Private Key": r"-----BEGIN (RSA|OPENSSH|DSA|EC) PRIVATE KEY-----",
+    "MongoDB URI": r"mongodb(?:\+srv)?://[^\s\"']+",
+    "MySQL URI": r"mysql://[^\s\"']+",
+    "Generic Secret": r"(?:secret_key|api_key|apikey|password|passwd)\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+}
 
 # ==========================================
 # STAGE 1: DEEP RECON
 # ==========================================
-def fetch_crtsh(target):
+def fetch_crtsh(t):
     subs = set()
     try:
-        r = requests.get(f"https://crt.sh/?q=%.{target}&output=json", timeout=20)
+        r = requests.get(f"https://crt.sh/?q=%.{t}&output=json", timeout=20)
         if r.status_code == 200:
-            for entry in r.json():
-                for sub in entry.get('name_value', '').split('\n'):
-                    sub = sub.strip().lower()
-                    if not sub.startswith('*') and sub.endswith(target): subs.add(sub)
+            for e in r.json():
+                for s in e.get('name_value', '').split('\n'):
+                    s = s.strip().lower()
+                    if not s.startswith('*') and s.endswith(t): subs.add(s)
     except: pass
     return subs
 
-def fetch_hackertarget(target):
+def fetch_hackertarget(t):
     subs = set()
     try:
-        r = requests.get(f"https://api.hackertarget.com/hostsearch/?q={target}", timeout=10)
+        r = requests.get(f"https://api.hackertarget.com/hostsearch/?q={t}", timeout=10)
         if r.status_code == 200 and "error" not in r.text.lower():
-            for line in r.text.splitlines():
-                parts = line.split(",")
-                if len(parts) == 2: subs.add(parts[0].strip().lower())
+            for l in r.text.splitlines():
+                p = l.split(",")
+                if len(p) == 2: subs.add(p[0].strip().lower())
     except: pass
     return subs
 
-def resolve_dns(sub):
-    try: return socket.gethostbyname(sub)
+def resolve_dns(s):
+    try: return socket.gethostbyname(s)
     except: return None
 
 def probe_subdomain(sub):
-    result = {
-        "host": sub, "ip": None, "is_cdn": False, "cdn_provider": None,
-        "http_status": None, "title": None, "server": None, 
-        "technologies": [], "missing_headers": [], "cookie_issues": [],
-        "sensitive_files": [], "hidden_api_endpoints": []
-    }
+    res = {"host": sub, "ip": None, "is_cdn": False, "http_status": None, "title": None, "server": None, "technologies": [], "missing_headers": [], "sensitive_files": [], "hidden_api_endpoints": [], "js_files": []}
     ip = resolve_dns(sub)
-    if not ip: return result
-    result["ip"] = ip
-
+    if not ip: return res
+    res["ip"] = ip
     for scheme in ['https', 'http']:
         try:
             r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
-            result["http_status"] = r.status_code
+            res["http_status"] = r.status_code
             if "<title>" in r.text.lower():
-                s = r.text.lower().find("<title>") + 7
-                e = r.text.lower().find("</title>", s)
-                result["title"] = r.text[s:e].strip()[:100]
-            
+                s = r.text.lower().find("<title>") + 7; e = r.text.lower().find("</title>", s)
+                res["title"] = r.text[s:e].strip()[:100]
             server = r.headers.get("Server", "Unknown")
-            result["server"] = server
-            if any(cdn in server.lower() for cdn in CDN_SERVERS):
-                result["is_cdn"] = True
-                result["cdn_provider"] = server
-            
+            res["server"] = server
+            if any(cdn in server.lower() for cdn in CDN_SERVERS): res["is_cdn"] = True
             techs = []
             if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
-            if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
-            result["technologies"] = techs
+            res["technologies"] = techs
+            res["missing_headers"] = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
+            res["hidden_api_endpoints"] = list(set(re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin)/[^"\']*)(?:["\'])', r.text)))[:10]
             
-            missing = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
-            result["missing_headers"] = missing
+            # Extract JS file paths
+            js_links = re.findall(r'(?:src=["\'])([^"\']+\.js(?:\?[^"\']*)?)', r.text)
+            res["js_files"] = [requests.compat.urljoin(f"{scheme}://{sub}", link) for link in js_links[:5]] # Top 5 JS files
             
-            api_patterns = re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin|user)/[^"\']*)(?:["\'])', r.text)
-            if api_patterns: result["hidden_api_endpoints"] = list(set(api_patterns))[:10]
             break
         except: continue
-    return result
+    return res
 
 def stage_1_recon(target):
     print(f"[+] Starting Deep Recon on {target}...")
     subs = fetch_crtsh(target) | fetch_hackertarget(target)
-    if target in subs: subs.add(target)
+    subs.add(target)
     print(f"[+] Found {len(subs)} unique subdomains.")
-    alive_assets = []
-    with ThreadPoolExecutor(max_workers=25) as executor:
-        futures = {executor.submit(probe_subdomain, sub): sub for sub in subs}
-        for future in as_completed(futures):
+    alive = []
+    with ThreadPoolExecutor(max_workers=25) as ex:
+        futs = {ex.submit(probe_subdomain, s): s for s in subs}
+        for f in as_completed(futs):
             try:
-                res = future.result()
-                if res["ip"]: alive_assets.append(res)
+                r = f.result()
+                if r["ip"]: alive.append(r)
             except: pass
-    print(f"[+] {len(alive_assets)} hosts alive.")
-    return alive_assets
+    print(f"[+] {len(alive)} hosts alive.")
+    return alive
 
 # ==========================================
-# STAGE 1.5: DEEP OSINT
+# STAGE 1.5: OSINT
 # ==========================================
-def github_secret_dorking(target):
-    print(f"[+] Running GitHub OSINT for {target}...")
-    queries = [
-        f'"{target}" password', f'"{target}" api_key', f'"{target}" .env',
-        f'"{target}" secret_key', f'"{target}" connection_string'
-    ]
-    leaked_data = []
-    for query in queries:
+def github_secret_dorking(t):
+    print(f"[+] GitHub OSINT...")
+    leaks = []
+    for q in [f'"{t}" password', f'"{t}" .env', f'"{t}" api_key']:
         try:
-            r = requests.get(
-                "https://api.github.com/search/code",
-                params={"q": query, "per_page": 5},
-                headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "OMNISCIENCE-Engine"},
-                timeout=15
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("total_count", 0) > 0:
-                    for item in data.get("items", []):
-                        leaked_data.append({
-                            "file": item.get("path"), "repo": item.get("repository", {}).get("full_name"),
-                            "url": item.get("html_url"), "query_used": query
-                        })
+            r = requests.get("https://api.github.com/search/code", params={"q": q, "per_page": 3}, headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "OMNI"}, timeout=15)
+            if r.status_code == 200 and r.json().get("total_count", 0) > 0:
+                for i in r.json().get("items", []): leaks.append({"file": i["path"], "repo": i["repository"]["full_name"], "url": i["html_url"]})
             time.sleep(3)
         except: pass
-    if leaked_data: print(f"[+] WARNING: Found {len(leaked_data)} potential code leaks on GitHub!")
-    else: print(f"[+] GitHub OSINT clean.")
-    return leaked_data
+    return leaks
 
-def discover_cloud_assets(target):
-    print(f"[+] Probing Cloud Assets for {target}...")
-    org_name = target.split('.')[0]
-    permutations = [
-        f"{org_name}-backup", f"{org_name}-dev", f"{org_name}-staging",
-        f"{org_name}-old", f"{org_name}-bucket", f"{target.replace('.', '-')}",
-        f"{target}-logs", f"{org_name}-assets", f"{org_name}-data"
-    ]
-    exposed_assets = []
-    
-    def check_s3(perm):
-        url = f"http://{perm}.s3.amazonaws.com"
+def discover_cloud_assets(t):
+    print(f"[+] Cloud Asset Probing...")
+    org = t.split('.')[0]
+    perms = [f"{org}-backup", f"{org}-dev", f"{org}-staging", f"{org}-bucket", t.replace('.', '-')]
+    exposed = []
+    def check_s3(p):
         try:
-            r = requests.get(url, timeout=4)
-            if r.status_code == 200: return {"type": "AWS S3 (PUBLIC READ)", "url": url, "severity": "CRITICAL"}
-            elif r.status_code == 403: return {"type": "AWS S3 (EXISTS)", "url": url, "severity": "INFO"}
+            r = requests.get(f"http://{p}.s3.amazonaws.com", timeout=4)
+            if r.status_code == 200: return {"type": "AWS S3 (PUBLIC)", "url": f"http://{p}.s3.amazonaws.com", "severity": "CRITICAL"}
+            elif r.status_code == 403: return {"type": "AWS S3 (EXISTS)", "url": f"http://{p}.s3.amazonaws.com", "severity": "INFO"}
         except: pass
-        return None
-
-    def check_firebase(perm):
-        url = f"https://{perm}.firebaseio.com/.json"
+    def check_fb(p):
         try:
-            r = requests.get(url, timeout=4)
-            if r.status_code == 200 and r.text != "null": return {"type": "Firebase DB (PUBLIC)", "url": url, "severity": "CRITICAL"}
+            r = requests.get(f"https://{p}.firebaseio.com/.json", timeout=4)
+            if r.status_code == 200 and r.text != "null": return {"type": "Firebase (PUBLIC)", "url": f"https://{p}.firebaseio.com", "severity": "CRITICAL"}
         except: pass
-        return None
+    with ThreadPoolExecutor(max_workers=15) as ex:
+        for f in as_completed([ex.submit(check_s3, p) for p in perms] + [ex.submit(check_fb, p) for p in perms]):
+            res = f.result()
+            if res: exposed.append(res)
+    return exposed
 
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        s3_futures = {executor.submit(check_s3, p): p for p in permutations}
-        fb_futures = {executor.submit(check_firebase, p): p for p in permutations}
-        for future in as_completed(s3_futures):
-            res = future.result()
-            if res: exposed_assets.append(res)
-        for future in as_completed(fb_futures):
-            res = future.result()
-            if res: exposed_assets.append(res)
-
-    if exposed_assets: print(f"[+] WARNING: Found {len(exposed_assets)} exposed cloud assets!")
-    else: print(f"[+] Cloud assets secure.")
-    return exposed_assets
-
-def stage_1_5_osint(target):
-    return { "github_leaks": github_secret_dorking(target), "cloud_assets": discover_cloud_assets(target) }
+def stage_1_5_osint(t): return {"github_leaks": github_secret_dorking(t), "cloud_assets": discover_cloud_assets(t)}
 
 # ==========================================
 # STAGE 2: WEB AUDIT
 # ==========================================
-def check_path(base_url, path):
+def check_path(u, p):
     try:
-        r = requests.get(f"{base_url}{path}", timeout=4, verify=False, allow_redirects=False)
-        if r.status_code in [200, 403, 401, 405]: return {"path": path, "status": r.status_code, "size": len(r.content)}
+        r = requests.get(f"{u}{p}", timeout=4, verify=False, allow_redirects=False)
+        if r.status_code in [200, 403, 401]: return {"path": p, "status": r.status_code}
     except: pass
-    return None
 
-def check_open_redirect(base_url, param):
+def check_redirect(u, p):
     try:
-        r = requests.get(f"{base_url}/?{param}=https://evil.com", timeout=4, verify=False, allow_redirects=False)
-        if r.status_code in [301, 302, 303, 307, 308] and "evil.com" in r.headers.get('Location', ''):
-            return {"parameter": param, "redirect_url": r.headers['Location']}
+        r = requests.get(f"{u}/?{p}=https://evil.com", timeout=4, verify=False, allow_redirects=False)
+        if r.status_code in [301, 302, 303] and "evil.com" in r.headers.get('Location', ''): return {"parameter": p}
     except: pass
-    return None
 
-def check_error_leaks(base_url):
-    leaks = []
-    for p in ["'", "{{7*7}}"]:
-        try:
-            r = requests.get(f"{base_url}/?id={p}", timeout=4, verify=False)
-            text = r.text.lower()
-            if "sql syntax" in text or "mysql_" in text: leaks.append({"type": "SQL Error Leak", "payload": p})
-            elif "49" in r.text and p == "{{7*7}}": leaks.append({"type": "SSTI Detected", "payload": p})
-        except: pass
-    return leaks
+def check_cors(u):
+    try:
+        r = requests.get(u, headers={"Origin": "https://evil.com"}, timeout=4, verify=False)
+        acao = r.headers.get("Access-Control-Allow-Origin", "")
+        if "evil.com" in acao and r.headers.get("Access-Control-Allow-Credentials", "").lower() == "true":
+            return {"issue": "CORS Misconfiguration (Allows evil.com with Credentials)"}
+    except: pass
 
 def stage_2_web_audit(assets):
-    print(f"[+] Starting Advanced Vulnerability Audit...")
-    for asset in assets:
-        if not asset["http_status"]: continue
-        base_url = f"https://{asset['host']}"
-        
-        all_paths = SENSITIVE_PATHS + ADVANCED_ENDPOINTS
-        found_files = []
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(check_path, base_url, path): path for path in all_paths}
-            for future in as_completed(futures):
-                res = future.result()
-                if res: found_files.append(res)
-        asset["sensitive_files"] = found_files
-        
-        open_redirects = []
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(check_open_redirect, base_url, param): param for param in REDIRECT_PARAMS}
-            for future in as_completed(futures):
-                res = future.result()
-                if res: open_redirects.append(res)
-        asset["open_redirects"] = open_redirects
-        
-        asset["data_leaks"] = check_error_leaks(base_url)
+    print(f"[+] Web Audit...")
+    for a in assets:
+        if not a["http_status"]: continue
+        b = f"https://{a['host']}"
+        found = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            for f in as_completed([ex.submit(check_path, b, p) for p in SENSITIVE_PATHS + ADVANCED_ENDPOINTS]):
+                res = f.result()
+                if res: found.append(res)
+        a["sensitive_files"] = found
+        redirs = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for f in as_completed([ex.submit(check_redirect, b, p) for p in REDIRECT_PARAMS]):
+                res = f.result()
+                if res: redirs.append(res)
+        a["open_redirects"] = redirs
+        a["cors_issue"] = check_cors(b)
     return assets
 
 # ==========================================
-# STAGE 3: PORT SCANNING
+# STAGE 2.5: HISTORICAL & DEEP JS (NEW!)
+# ==========================================
+def fetch_wayback_urls(target):
+    print(f"[+] Fetching Wayback Machine history...")
+    interesting_paths = set()
+    try:
+        r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=200", timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            for entry in data[1:]: # Skip header
+                url = entry[0]
+                path = urlparse(url).path
+                # Only keep "interesting" paths (admin, api, config, login, dashboard)
+                if any(kw in path.lower() for kw in ['admin', 'api', 'config', 'login', 'dashboard', 'upload', 'db', 'user', 'env']):
+                    interesting_paths.add(path)
+    except: pass
+    print(f"[+] Wayback found {len(interesting_paths)} interesting historical endpoints.")
+    return list(interesting_paths)[:30] # Cap at 30 to save time
+
+def extract_js_secrets(js_urls):
+    print(f"[+] Analyzing {len(js_urls)} JS files for secrets...")
+    found_secrets = []
+    for url in js_urls:
+        try:
+            r = requests.get(url, timeout=5, verify=False)
+            for name, pattern in SECRET_PATTERNS.items():
+                matches = re.findall(pattern, r.text)
+                for m in matches:
+                    found_secrets.append({"file": url, "type": name, "value": m[:50] + "..." if len(m) > 50 else m})
+        except: pass
+    return found_secrets
+
+def stage_2_5_history_and_secrets(assets, target):
+    historical_paths = fetch_wayback_urls(target)
+    
+    # Probe historical paths on alive assets
+    for a in assets:
+        if not a["http_status"]: continue
+        b = f"https://{a['host']}"
+        found_hist = []
+        with ThreadPoolExecutor(max_workers=15) as ex:
+            for f in as_completed([ex.submit(check_path, b, p) for p in historical_paths]):
+                res = f.result()
+                if res and res["status"] == 200: found_hist.append(res)
+        a["historical_endpoints"] = found_hist
+        
+        # Extract secrets from JS
+        if a.get("js_files"):
+            a["js_secrets"] = extract_js_secrets(a["js_files"])
+        else:
+            a["js_secrets"] = []
+            
+    return assets
+
+# ==========================================
+# STAGE 3 & 3.5: PORTS & MEMORY
 # ==========================================
 def scan_port(ip, port):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.5)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1.5)
         if s.connect_ex((ip, port)) == 0: return port
         s.close()
     except: pass
-    return None
 
 def stage_3_network_scan(assets):
-    origin_assets = [a for a in assets if not a["is_cdn"]]
-    cdn_assets = [a for a in assets if a["is_cdn"]]
-    print(f"[+] {len(origin_assets)} Origin assets. Scanning top ports...")
-    for asset in origin_assets:
-        ip = asset["ip"]
-        open_ports = []
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            futures = {executor.submit(scan_port, ip, p): p for p in TOP_PORTS}
-            for future in as_completed(futures):
-                port = future.result()
-                if port: open_ports.append(port)
-        asset["open_ports"] = sorted(open_ports) if open_ports else []
-    for a in cdn_assets: a["open_ports"] = ["CDN Protected"]
-    return origin_assets + cdn_assets
+    origins = [a for a in assets if not a["is_cdn"]]
+    cdns = [a for a in assets if a["is_cdn"]]
+    print(f"[+] Scanning {len(origins)} origin IPs...")
+    for a in origins:
+        ports = []
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            for f in as_completed([ex.submit(scan_port, a["ip"], p) for p in TOP_PORTS]):
+                res = f.result()
+                if res: ports.append(res)
+        a["open_ports"] = sorted(ports) if ports else []
+    for c in cdns: c["open_ports"] = ["CDN Protected"]
+    return origins + cdns
 
-# ==========================================
-# STAGE 3.5: SELF-LEARNING FILTER (Phase 8)
-# ==========================================
 def apply_memory_filter(assets):
     if not FALSE_PATTERNS: return assets
-    print(f"[+] Memory Filter active. Ignoring patterns: {FALSE_PATTERNS}")
-    
-    for asset in assets:
-        # Filter sensitive files
-        asset["sensitive_files"] = [
-            f for f in asset.get("sensitive_files", [])
-            if not any(fp in json.dumps(f).upper() for fp in FALSE_PATTERNS)
-        ]
-        # Filter data leaks (e.g., fake SSTI)
-        asset["data_leaks"] = [
-            l for l in asset.get("data_leaks", [])
-            if not any(fp in json.dumps(l).upper() for fp in FALSE_PATTERNS)
-        ]
-        # Filter open redirects
-        asset["open_redirects"] = [
-            r for r in asset.get("open_redirects", [])
-            if not any(fp in json.dumps(r).upper() for fp in FALSE_PATTERNS)
-        ]
+    print(f"[+] Memory Filter active: {FALSE_PATTERNS}")
+    for a in assets:
+        a["sensitive_files"] = [f for f in a.get("sensitive_files", []) if not any(fp in json.dumps(f).upper() for fp in FALSE_PATTERNS)]
+        a["data_leaks"] = [l for l in a.get("data_leaks", []) if not any(fp in json.dumps(l).upper() for fp in FALSE_PATTERNS)]
     return assets
 
 # ==========================================
-# AI STAGES
+# AI & DELIVERY
 # ==========================================
-def call_gemini(prompt, api_key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-    payload = {"contents": [{"parts":[{"text": prompt}]}], "generationConfig": { "temperature": 0.4, "maxOutputTokens": 8192 }}
-    r = requests.post(url, json=payload, timeout=90)
+def call_gemini(prompt, key):
+    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={key}", json={"contents": [{"parts":[{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192}}, timeout=90)
     r.raise_for_status()
     return r.json()['candidates'][0]['content']['parts'][0]['text']
 
-def call_gemini_with_retry(prompt):
-    keys = [k for k in API_KEYS if k]
-    random.shuffle(keys)
-    for i, key in enumerate(keys):
-        try:
-            print(f"[+] Attempting API Key #{i+1}...")
-            return call_gemini(prompt, key)
-        except Exception as e:
-            print(f"[-] Key #{i+1} failed: {str(e)}")
-    raise Exception("All API keys exhausted.")
+def call_gemini_retry(prompt):
+    keys = [k for k in API_KEYS if k]; random.shuffle(keys)
+    for i, k in enumerate(keys):
+        try: print(f"[+] Gemini Key #{i+1}"); return call_gemini(prompt, k)
+        except Exception as e: print(f"[-] Fail: {e}")
+    raise Exception("Keys dead")
 
-def stage_4_ai_analysis(data, osint_data):
-    print("[+] Running AI Stage 1: Vulnerability & OSINT Extraction...")
-    prompt = f"""You are a Tier-1 Red Team Operator. Analyze this raw scan data AND OSINT data for '{TARGET}':
-
-    --- NETWORK & WEB DATA ---
+def stage_4_ai(data, osint):
+    print("[+] AI Stage 1...")
+    prompt = f"""You are a Tier-1 Red Team Operator. Analyze this data for '{TARGET}':
+    --- NETWORK & WEB ---
     {json.dumps(data, indent=2)}
+    --- OSINT ---
+    {json.dumps(osint, indent=2)}
+    STRICT RULES: DO NOT GUESS. If GitHub leaks/Cloud assets found -> CRITICAL. If hardcoded JS secrets found -> CRITICAL. If historical endpoints (admin/login) are alive -> HIGH. Explain What, Why, How for each. Map to OWASP/MITRE.
+    Output strictly as JSON array: [{{"asset": "...", "what_was_found": "...", "why_its_vulnerable": "...", "how_to_exploit": "...", "severity": "...", "owasp": "...", "mitre": "..."}}]"""
+    return call_gemini_retry(prompt)
 
-    --- OSINT & LEAK DATA ---
-    {json.dumps(osint_data, indent=2)}
-    
-    STRICT RULES:
-    1. DO NOT GUESS. Base everything on the provided evidence.
-    2. If GitHub leaks are found, treat them as CRITICAL.
-    3. If public Cloud assets (S3/Firebase) are found, treat them as CRITICAL.
-    4. For web findings, explain What, Why, and How to exploit.
-    5. Map ONLY proven risks to MITRE ATT&CK and OWASP Top 10.
-    
-    Output strictly as JSON array:
-    [
-        {{
-            "asset": "subdomain.target.com or GitHub/Cloud",
-            "what_was_found": "Exact description",
-            "why_its_vulnerable": "Technical flaw",
-            "how_to_exploit": "Brief scenario",
-            "severity": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
-            "owasp_category": "e.g., A01:2021",
-            "mitre_technique": "e.g., T1190"
-        }}
-    ]"""
-    return call_gemini_with_retry(prompt)
+def stage_5_report(intel):
+    print("[+] AI Stage 2...")
+    prompt = f"""You are a CISO assistant. Format this intel for '{TARGET}': {intel}
+    Markdown report with: 1. 🎯 Exec Summary (Risk /100). 2. ☣️ OSINT/Leaks/JS Secrets (CRITICAL). 3. 🗺️ Attack Map. 4. 🚨 Vulns (Include Historical Endpoints). 5. 🛡️ OWASP/MITRE. 6. 🔧 Fixes."""
+    return call_gemini_retry(intel)
 
-def stage_5_ai_report(intel):
-    print("[+] Running AI Stage 2: Final Report Generation...")
-    prompt = f"""You are a CISO reporting assistant. Take this red team intelligence for '{TARGET}':
-    {intel}
-    
-    Write a highly detailed, professional Markdown report. Include:
-    1. 🎯 **Executive Summary:** (Risk score out of 100, highlight OSINT/Leaks immediately).
-    2. ☣️ **OSINT & Leaks (CRITICAL):** Detail any GitHub code leaks or exposed Cloud buckets first.
-    3. 🗺️ **Attack Surface Map:** Web assets, CDN protection, open ports.
-    4. 🚨 **Vulnerable Endpoints:** Web misconfigurations, API exposures, Open Redirects.
-    5. 🛡️ **OWASP & MITRE Mapping:** Group findings.
-    6. 🔧 **Remediation Steps:** Specific, actionable fixes."""
-    return call_gemini_with_retry(intel)
-
-# ==========================================
-# DELIVERY & MAIN
-# ==========================================
-def stage_6_deliver(report):
-    print("[+] Delivering report...")
-    payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}
-    try: requests.post(CALLBACK_URL, json=payload, timeout=30)
-    except Exception as e: print(f"[-] Failed: {e}")
+def deliver(report):
+    print("[+] Delivering...")
+    requests.post(CALLBACK_URL, json={"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}, timeout=30)
 
 if __name__ == "__main__":
-    print(f"=== OMNISCIENCE ENGINE v2.1 (Self-Learning) STARTED ===")
-    
+    print(f"=== OMNISCIENCE v3.0 (History & Secrets) STARTED ===")
     assets = stage_1_recon(TARGET)
-    osint_data = stage_1_5_osint(TARGET)
+    osint = stage_1_5_osint(TARGET)
     assets = stage_2_web_audit(assets)
-    full_data = stage_3_network_scan(assets)
+    assets = stage_2_5_history_and_secrets(assets, TARGET) # NEW
+    full = stage_3_network_scan(assets)
+    full = apply_memory_filter(full)
     
-    # Apply Self-Learning Filter
-    full_data = apply_memory_filter(full_data)
-    
-    with open('./cache/raw_data.json', 'w') as f:
-        json.dump({"target": TARGET, "assets": full_data, "osint": osint_data}, f, indent=2)
-    
-    intel = stage_4_ai_analysis(full_data, osint_data)
-    with open('./cache/processed_intel.json', 'w') as f: f.write(intel)
-        
-    report = stage_5_ai_report(intel)
-    with open('./cache/final_report.md', 'w') as f: f.write(report)
-        
-    stage_6_deliver(report)
-    print(f"=== OMNISCIENCE ENGINE COMPLETE ===")
+    with open('./cache/raw.json', 'w') as f: json.dump({"target": TARGET, "assets": full, "osint": osint}, f, indent=2)
+    intel = stage_4_ai(full, osint)
+    with open('./cache/intel.json', 'w') as f: f.write(intel)
+    report = stage_5_report(intel)
+    with open('./cache/report.md', 'w') as f: f.write(report)
+    deliver(report)
+    print(f"=== OMNISCIENCE COMPLETE ===")

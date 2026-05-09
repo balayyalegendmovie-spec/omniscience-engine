@@ -9,6 +9,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
+# Try importing Playwright (graceful fallback if it fails to install)
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    print("[-] Playwright not installed. Visual PoCs disabled.")
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TARGET = os.environ.get('TARGET')
@@ -17,12 +25,11 @@ CALLBACK_URL = os.environ.get('CALLBACK_URL')
 API_KEYS = [os.environ.get(f'GEMINI_KEY_{i}') for i in range(1, 7)]
 FALSE_PATTERNS = [p.strip().upper() for p in os.environ.get('FALSE_PATTERNS', '').split(',') if p.strip()]
 
-# GITHUB ACTIONS SUMMARY LOGING
 SUMMARY_FILE = os.environ.get('GITHUB_STEP_SUMMARY')
 def log_summary(text):
-    print(text) # Keep console logging too
+    print(text)
     if SUMMARY_FILE:
-        try:
+        try: 
             with open(SUMMARY_FILE, 'a') as f: f.write(text + "\n")
         except: pass
 
@@ -53,6 +60,40 @@ TAKEOVER_FINGERPRINTS = {
     "tumblr": ["Whatever you were looking for doesn't currently exist"],
     "wordpress": ["Do you want to register"]
 }
+
+SCREENSHOT_DIR = "./cache/screenshots"
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+# ==========================================
+# VISUAL PROOF ENGINE (PLAYWRIGHT)
+# ==========================================
+def capture_screenshot(url, vuln_name):
+    if not PLAYWRIGHT_AVAILABLE: return None
+    try:
+        safe_filename = re.sub(r'[^a-zA-Z0-9]', '_', vuln_name)[:20] + ".png"
+        filepath = os.path.join(SCREENSHOT_DIR, safe_filename)
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=['--ignore-certificate-errors', '--no-sandbox'])
+            page = browser.new_page()
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            page.screenshot(path=filepath, full_page=False)
+            browser.close()
+            
+        log_summary(f"  📸 Screenshot captured for {vuln_name}")
+        return filepath
+    except Exception as e:
+        log_summary(f"  ❌ Screenshot failed for {url}: {e}")
+        return None
+
+def upload_image(filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            r = requests.post("https://0x0.st", files={'file': f}, timeout=15)
+            if r.status_code == 200 and r.text.strip().startswith("http"):
+                return r.text.strip()
+    except: pass
+    return None
 
 # ==========================================
 # STAGE 1: DEEP RECON
@@ -102,21 +143,27 @@ def probe_subdomain(sub):
             if "<title>" in r.text.lower():
                 s = r.text.lower().find("<title>") + 7; e = r.text.lower().find("</title>", s)
                 res["title"] = r.text[s:e].strip()[:100]
+            
             server = r.headers.get("Server", "Unknown")
             res["server"] = server
             if any(cdn in server.lower() for cdn in CDN_SERVERS): res["is_cdn"] = True
+            
             techs = []
             if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
             if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
             res["technologies"] = techs
+            
             res["missing_headers"] = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
             res["hidden_api_endpoints"] = list(set(re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin)/[^"\']*)(?:["\'])', r.text)))[:10]
             res["js_files"] = [requests.compat.urljoin(f"{scheme}://{sub}", link) for link in re.findall(r'(?:src=["\'])([^"\']+\.js(?:\?[^"\']*)?)', r.text)[:5]]
+            
+            # RESTORED: Cookie Security Checks
             bad_cookies = []
             for cookie in r.cookies:
                 if not cookie.secure: bad_cookies.append(f"Cookie '{cookie.name}' missing Secure flag")
                 if not cookie.has_nonstandard_attr('httponly'): bad_cookies.append(f"Cookie '{cookie.name}' missing HttpOnly")
             res["cookie_issues"] = bad_cookies
+            
             break
         except: continue
     return res
@@ -125,7 +172,7 @@ def stage_1_recon(target):
     log_summary(f"## 🔎 Stage 1: Deep Recon on `{target}`")
     subs = fetch_crtsh(target) | fetch_hackertarget(target)
     subs.add(target)
-    log_summary(f"- 📡 Found **{len(subs)}** unique subdomains from APIs.")
+    log_summary(f"- 📡 Found **{len(subs)}** unique subdomains.")
     alive = []
     with ThreadPoolExecutor(max_workers=25) as ex:
         futs = {ex.submit(probe_subdomain, s): s for s in subs}
@@ -134,11 +181,11 @@ def stage_1_recon(target):
                 r = f.result()
                 if r["ip"]: alive.append(r)
             except: pass
-    log_summary(f"- ✅ **{len(alive)}** hosts alive and responding.")
+    log_summary(f"- ✅ **{len(alive)}** hosts alive.")
     return alive
 
 # ==========================================
-# STAGE 1.5: OSINT
+# STAGE 1.5 & 1.8: OSINT & DNS
 # ==========================================
 def github_secret_dorking(t):
     leaks = []
@@ -152,8 +199,7 @@ def github_secret_dorking(t):
     return leaks
 
 def discover_cloud_assets(t):
-    org = t.split('.')[0]
-    perms = [f"{org}-backup", f"{org}-dev", f"{org}-staging", f"{org}-bucket", t.replace('.', '-')]
+    org = t.split('.')[0]; perms = [f"{org}-backup", f"{org}-dev", f"{org}-staging", f"{org}-bucket", t.replace('.', '-')]
     exposed = []
     def check_s3(p):
         try:
@@ -186,26 +232,30 @@ def stage_1_8_dns_txt(target):
     try:
         r = requests.get(f"https://dns.google/resolve?name={target}&type=TXT", timeout=5)
         if r.status_code == 200:
-            for ans in r.json().get("Answer", []):
-                txts.append(ans.get("data", ""))
+            for ans in r.json().get("Answer", []): txts.append(ans.get("data", ""))
     except: pass
-    log_summary(f"- Extracted **{len(txts)}** TXT records (SPF, Domain Verifications, etc.).")
+    log_summary(f"- Extracted **{len(txts)}** TXT records.")
     return txts
 
 # ==========================================
-# STAGE 2: WEB AUDIT (FIXED)
+# STAGE 2: WEB AUDIT + PROOF CAPTURE
 # ==========================================
 def check_path(u, p):
     try:
         r = requests.get(f"{u}{p}", timeout=4, verify=False, allow_redirects=False)
-        if r.status_code in [200, 403, 401]: return {"path": p, "status": r.status_code}
+        if r.status_code in [200, 403, 401]:
+            evidence = r.text[:300] if r.status_code == 200 else "Access Denied/Protected"
+            return {"path": p, "status": r.status_code, "evidence": evidence, "full_url": f"{u}{p}"}
     except: pass
+    return None
 
 def check_redirect(u, p):
     try:
         r = requests.get(f"{u}/?{p}=https://evil.com", timeout=4, verify=False, allow_redirects=False)
-        if r.status_code in [301, 302, 303] and "evil.com" in r.headers.get('Location', ''): return {"parameter": p}
+        if r.status_code in [301, 302, 303] and "evil.com" in r.headers.get('Location', ''):
+            return {"parameter": p, "full_url": f"{u}/?{p}=https://evil.com", "redirects_to": r.headers['Location']}
     except: pass
+    return None
 
 def check_cors(u):
     try:
@@ -214,26 +264,29 @@ def check_cors(u):
         if "evil.com" in acao and r.headers.get("Access-Control-Allow-Credentials", "").lower() == "true":
             return {"issue": "CORS Misconfiguration"}
     except: pass
+    return None
 
+# RESTORED: Error Leak Provocation
 def check_error_leaks(u):
     leaks = []
     for p in ["'", "{{7*7}}"]:
         try:
             r = requests.get(f"{u}/?id={p}", timeout=4, verify=False)
             text = r.text.lower()
-            if "sql syntax" in text or "mysql_" in text: leaks.append({"type": "SQL Error Leak", "payload": p})
-            elif "49" in r.text and p == "{{7*7}}": leaks.append({"type": "SSTI Detected", "payload": p})
+            if "sql syntax" in text or "mysql_" in text: leaks.append({"type": "SQL Error Leak", "payload": p, "evidence": "SQL syntax error exposed", "full_url": f"{u}/?id={p}"})
+            elif "49" in r.text and p == "{{7*7}}": leaks.append({"type": "SSTI Detected", "payload": p, "evidence": "Response contained '49' from {{7*7}}", "full_url": f"{u}/?id={p}"})
         except: pass
     return leaks
 
 def stage_2_web_audit(assets):
-    log_summary("## 🌐 Stage 2: Web Vulnerability Audit")
-    total_paths = 0
-    total_redirs = 0
-    total_leaks = 0
+    log_summary("## 🌐 Stage 2: Web Vulnerability Audit & PoC Capture")
+    total_paths = 0; total_redirs = 0; total_leaks = 0
+    screenshots_to_send = []
+    
     for a in assets:
         if not a["http_status"]: continue
         b = f"https://{a['host']}"
+        
         found = []
         with ThreadPoolExecutor(max_workers=20) as ex:
             for f in as_completed([ex.submit(check_path, b, p) for p in SENSITIVE_PATHS + ADVANCED_ENDPOINTS]):
@@ -241,6 +294,15 @@ def stage_2_web_audit(assets):
                 if res: found.append(res)
         a["sensitive_files"] = found
         total_paths += len(found)
+        
+        # VISUAL PROOF LOGIC
+        for f in found:
+            if f["status"] == 200 and any(kw in f["path"] for kw in ['/.git', '/.env', '/actuator', 'phpinfo', 'swagger', 'console']):
+                log_summary(f"- 🚨 CRITICAL PoC Found: {f['full_url']}")
+                filepath = capture_screenshot(f["full_url"], f["path"].replace('/', '_'))
+                if filepath:
+                    img_url = upload_image(filepath)
+                    if img_url: screenshots_to_send.append({"vuln": f["path"], "url": img_url})
         
         redirs = []
         with ThreadPoolExecutor(max_workers=10) as ex:
@@ -251,53 +313,56 @@ def stage_2_web_audit(assets):
         total_redirs += len(redirs)
         
         a["cors_issue"] = check_cors(b)
+        
+        # RESTORED: Data Leaks
         a["data_leaks"] = check_error_leaks(b)
         total_leaks += len(a["data_leaks"])
         
-    # FIXED TYPO HERE: f"- ..." changed to f"..."
     log_summary(f"- Exposed Paths: **{total_paths}**")
     log_summary(f"- Open Redirects: **{total_redirs}**")
     log_summary(f"- Error/Injection Leaks: **{total_leaks}**")
-    return assets
+    log_summary(f"- 📸 Visual PoCs Captured: **{len(screenshots_to_send)}**")
+    return assets, screenshots_to_send
 
 # ==========================================
-# STAGE 2.5: HISTORY & JS SECRETS
+# STAGES 2.5 & 2.8: HISTORY, SECRETS & TAKEOVERS
 # ==========================================
 def fetch_wayback_urls(target):
-    interesting_paths = set()
+    paths = set()
     try:
-        r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=200", timeout=15)
+        r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=100", timeout=15)
         if r.status_code == 200:
-            for entry in r.json()[1:]:
-                path = urlparse(entry[0]).path
-                if any(kw in path.lower() for kw in ['admin', 'api', 'config', 'login', 'dashboard', 'upload', 'db', 'user', 'env']):
-                    interesting_paths.add(path)
+            for e in r.json()[1:]:
+                p = urlparse(e[0]).path
+                if any(kw in p.lower() for kw in ['admin', 'api', 'config', 'login', 'dashboard', 'upload', 'db', 'user', 'env']):
+                    paths.add(p)
     except: pass
-    return list(interesting_paths)[:30]
+    return list(paths)[:30]
 
 def extract_js_secrets(js_urls):
-    found_secrets = []
+    secrets = []
     for url in js_urls:
         try:
             r = requests.get(url, timeout=5, verify=False)
-            for name, pattern in SECRET_PATTERNS.items():
-                matches = re.findall(pattern, r.text)
-                for m in matches: found_secrets.append({"file": url, "type": name, "value": m[:50] + "..." if len(m) > 50 else m})
+            for n, p in SECRET_PATTERNS.items():
+                for m in re.findall(p, r.text): secrets.append({"file": url, "type": n, "value": m[:50]})
         except: pass
-    return found_secrets
+    return secrets
 
 def stage_2_5_history_and_secrets(assets, target):
     log_summary("## ⏳ Stage 2.5: Wayback History & JS Secrets")
-    historical_paths = fetch_wayback_urls(target)
-    log_summary(f"- Wayback Machine found **{len(historical_paths)}** interesting historical endpoints.")
-    total_hist = 0
-    total_js = 0
+    hist_paths = fetch_wayback_urls(target)
+    log_summary(f"- Wayback Machine found **{len(hist_paths)}** interesting historical endpoints.")
+    total_hist = 0; total_js = 0
+    
     for a in assets:
         if not a["http_status"]: continue
         b = f"https://{a['host']}"
+        
         found_hist = []
         with ThreadPoolExecutor(max_workers=15) as ex:
-            for f in as_completed([ex.submit(check_path, b, p) for p in historical_paths]):
+            futs = [ex.submit(check_path, b, p) for p in hist_paths]
+            for f in as_completed(futs):
                 res = f.result()
                 if res and res["status"] == 200: found_hist.append(res)
         a["historical_endpoints"] = found_hist
@@ -310,9 +375,6 @@ def stage_2_5_history_and_secrets(assets, target):
     log_summary(f"- Hardcoded Secrets in JS: **{total_js}**")
     return assets
 
-# ==========================================
-# STAGE 2.8: SUBDOMAIN TAKEOVER
-# ==========================================
 def check_takeover(sub):
     try:
         r = requests.get(f"https://dns.google/resolve?name={sub}&type=CNAME", timeout=5)
@@ -325,6 +387,7 @@ def check_takeover(sub):
                     elif "herokuapp.com" in cname: vulnerable_provider = "heroku"
                     elif "myshopify.com" in cname: vulnerable_provider = "shopify"
                     elif "github.io" in cname: vulnerable_provider = "github"
+                    elif "pantheon.io" in cname: vulnerable_provider = "pantheon"
                     elif "zendesk.com" in cname: vulnerable_provider = "zendesk"
                     elif "tumblr.com" in cname: vulnerable_provider = "tumblr"
                     elif "wordpress.com" in cname: vulnerable_provider = "wordpress"
@@ -387,7 +450,7 @@ def apply_memory_filter(assets):
     return assets
 
 # ==========================================
-# AI & DELIVERY
+# AI & DELIVERY (PoC Prompt Forcing)
 # ==========================================
 def call_gemini(prompt, key):
     r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={key}", json={"contents": [{"parts":[{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192}}, timeout=90)
@@ -402,39 +465,51 @@ def call_gemini_retry(prompt):
     raise Exception("Keys dead")
 
 def stage_4_ai(data, osint, takeovers, txts):
-    log_summary("## 🧠 Stage 4: AI Threat Analysis")
-    prompt = f"""You are a Tier-1 Red Team Operator. Analyze this data for '{TARGET}':
+    log_summary("## 🧠 Stage 4: AI Threat Analysis (PoC Generation)")
+    prompt = f"""You are a Tier-1 Red Team Operator writing a PROOF OF CONCEPT report for '{TARGET}'. 
+    Analyze this data:
     --- NETWORK & WEB --- {json.dumps(data, indent=2)}
     --- OSINT --- {json.dumps(osint, indent=2)}
     --- TAKEOVERS --- {json.dumps(takeovers, indent=2)}
     --- DNS TXT --- {json.dumps(txts, indent=2)}
-    STRICT RULES: DO NOT GUESS. Takeovers -> CRITICAL. GitHub/Cloud/JS secrets -> CRITICAL. Historical endpoints -> HIGH. SSTI/SQLi -> Explain payload. Map to OWASP/MITRE.
-    Output strictly as JSON array: [{{"asset": "...", "what_was_found": "...", "why_its_vulnerable": "...", "how_to_exploit": "...", "severity": "...", "owasp": "...", "mitre": "..."}}]"""
-    intel = call_gemini_retry(prompt)
-    log_summary("- ✅ Threat Extraction Complete.")
-    return intel
+
+    STRICT RULES:
+    1. DO NOT GUESS. Base everything on the provided evidence.
+    2. For EVERY finding, you MUST provide:
+       - "vulnerable_url": The EXACT URL tested (from the data).
+       - "poc_command": A ready-to-run `cURL` command to reproduce the issue.
+       - "evidence_snippet": The exact text snippet returned by the server (from the "evidence" field in the data).
+    3. Map to OWASP/MITRE.
+    Output strictly as JSON array: [{{"asset": "...", "what_was_found": "...", "vulnerable_url": "...", "poc_command": "...", "evidence_snippet": "...", "severity": "...", "owasp": "...", "mitre": "..."}}]"""
+    return call_gemini_retry(prompt)
 
 def stage_5_report(intel):
     log_summary("## 📝 Stage 5: AI Report Generation")
     prompt = f"""You are a CISO assistant. Format this intel for '{TARGET}': {intel}
-    Markdown report with: 1. 🎯 Exec Summary (Risk /100). 2. ☣️ OSINT/Leaks/JS Secrets. 3. 💀 Takeovers. 4. 🗺️ Attack Map. 5. 🚨 Vulns (History, SSTI, CORS, Cookies). 6. 🛡️ OWASP/MITRE. 7. 🔧 Fixes."""
-    report = call_gemini_retry(prompt)
-    log_summary("- ✅ Report Generated.")
-    return report
+    Markdown report with: 
+    1. 🎯 Exec Summary (Risk /100). 
+    2. ☣️ OSINT/Leaks/JS Secrets. 
+    3. 💀 Takeovers. 
+    4. 🗺️ Attack Map. 
+    5. 🚨 Vulnerabilities WITH EXACT URLS AND CURL COMMANDS FOR EACH.
+    6. 🛡️ OWASP/MITRE. 
+    7. 🔧 Fixes."""
+    return call_gemini_retry(intel)
 
-def deliver(report):
+def deliver(report, screenshots):
     log_summary("## 🚀 Stage 6: Delivery")
-    requests.post(CALLBACK_URL, json={"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}, timeout=30)
+    payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report, "screenshots": screenshots}
+    requests.post(CALLBACK_URL, json=payload, timeout=30)
     log_summary("- ✅ Sent to Google Apps Script.")
 
 if __name__ == "__main__":
-    log_summary(f"# 🛡️ OMNISCIENCE v3.2.1 Scan: `{TARGET}`")
-    log_summary(f"Started at: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n---")
+    log_summary(f"# 🛡️ OMNISCIENCE v4.1 (Complete Edition): `{TARGET}`")
+    start_time = time.time()
     
     assets = stage_1_recon(TARGET)
     osint = stage_1_5_osint(TARGET)
     txts = stage_1_8_dns_txt(TARGET)
-    assets = stage_2_web_audit(assets)
+    assets, screenshots = stage_2_web_audit(assets)
     assets = stage_2_5_history_and_secrets(assets, TARGET)
     takeovers = stage_2_8_takeover_scan(assets)
     full = stage_3_network_scan(assets)
@@ -445,6 +520,8 @@ if __name__ == "__main__":
     with open('./cache/intel.json', 'w') as f: f.write(intel)
     report = stage_5_report(intel)
     with open('./cache/report.md', 'w') as f: f.write(report)
-    deliver(report)
     
-    log_summary("\n---\n🟢 **SCAN COMPLETE**")
+    deliver(report, screenshots)
+    
+    elapsed = round(time.time() - start_time, 2)
+    log_summary(f"\n---\n🟢 **SCAN COMPLETE in {elapsed}s**")

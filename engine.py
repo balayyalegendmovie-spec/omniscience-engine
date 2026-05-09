@@ -5,6 +5,7 @@ import requests
 import socket
 import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -19,11 +20,24 @@ API_KEYS = [
 ]
 
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
-
 CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'awselb', 'fastly']
 
+SENSITIVE_PATHS = [
+    '/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php',
+    '/phpinfo.php', '/admin', '/admin/login', '/robots.txt', '/sitemap.xml',
+    '/server-status', '/server-info', '/.htaccess', '/config.yml', '/package.json',
+    '/.DS_Store', '/backup.sql', '/database.sql', '/.well-known/security.txt'
+]
+
+SECURITY_HEADERS = [
+    'Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy',
+    'X-Content-Type-Options', 'Referrer-Policy', 'Permissions-Policy',
+    'X-XSS-Protection', 'Feature-Policy', 'Cross-Origin-Opener-Policy',
+    'Cross-Origin-Resource-Policy', 'Expect-CT'
+]
+
 # ==========================================
-# STAGE 1: DEEP RECON (Real Data Only)
+# STAGE 1: DEEP RECON
 # ==========================================
 def fetch_crtsh(target):
     subs = set()
@@ -56,7 +70,8 @@ def probe_subdomain(sub):
     result = {
         "host": sub, "ip": None, "is_cdn": False, "cdn_provider": None,
         "http_status": None, "title": None, "server": None, 
-        "technologies": [], "security_headers": {}
+        "technologies": [], "missing_headers": [], "cookie_issues": [],
+        "sensitive_files": []
     }
     
     ip = resolve_dns(sub)
@@ -68,48 +83,44 @@ def probe_subdomain(sub):
             r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
             result["http_status"] = r.status_code
             
-            # Title
             if "<title>" in r.text.lower():
                 s = r.text.lower().find("<title>") + 7
                 e = r.text.lower().find("</title>", s)
                 result["title"] = r.text[s:e].strip()[:100]
             
-            # Server & CDN Check
             server = r.headers.get("Server", "Unknown")
             result["server"] = server
             if any(cdn in server.lower() for cdn in CDN_SERVERS):
                 result["is_cdn"] = True
                 result["cdn_provider"] = server
             
-            # Real Tech Fingerprinting (No guessing)
             techs = []
             if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
             if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
             if "wordpress" in r.text.lower()[:2000]: techs.append("WordPress Detected")
-            if "joomla" in r.text.lower()[:2000]: techs.append("Joomla Detected")
-            if "drupal" in r.text.lower()[:2000]: techs.append("Drupal Detected")
             result["technologies"] = techs
             
-            # Quick Security Header Check
-            result["security_headers"] = {
-                "Strict-Transport-Security": bool(r.headers.get("Strict-Transport-Security")),
-                "X-Frame-Options": bool(r.headers.get("X-Frame-Options")),
-                "Content-Security-Policy": bool(r.headers.get("Content-Security-Policy"))
-            }
+            # Security Headers Check
+            missing = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
+            result["missing_headers"] = missing
+            
+            # Cookie Security Check
+            bad_cookies = []
+            for cookie in r.cookies:
+                if not cookie.secure: bad_cookies.append(f"Cookie '{cookie.name}' missing Secure flag")
+                if not cookie.has_nonstandard_attr('httponly'): bad_cookies.append(f"Cookie '{cookie.name}' missing HttpOnly")
+            result["cookie_issues"] = bad_cookies
+            
             break
         except: continue
     return result
 
 def stage_1_recon(target):
     print(f"[+] Starting Deep Recon on {target}...")
-    
-    # 1. Enumerate from multiple sources
     subs = fetch_crtsh(target) | fetch_hackertarget(target)
     if target in subs: subs.add(target)
-    print(f"[+] Found {len(subs)} unique subdomains from APIs.")
+    print(f"[+] Found {len(subs)} unique subdomains.")
     
-    # 2. Probe concurrently
-    print(f"[+] Probing {len(subs)} subdomains...")
     alive_assets = []
     with ThreadPoolExecutor(max_workers=25) as executor:
         futures = {executor.submit(probe_subdomain, sub): sub for sub in subs}
@@ -118,12 +129,47 @@ def stage_1_recon(target):
                 res = future.result()
                 if res["ip"]: alive_assets.append(res)
             except: pass
-    
-    print(f"[+] {len(alive_assets)} hosts alive. Filtering CDN for port scan...")
+    print(f"[+] {len(alive_assets)} hosts alive.")
     return alive_assets
 
 # ==========================================
-# STAGE 2: ORIGIN PORT SCANNING
+# STAGE 2: WEB FUZZING (OWASP Misconfigs)
+# ==========================================
+def check_sensitive_path(base_url, path):
+    try:
+        r = requests.get(f"{base_url}{path}", timeout=4, verify=False, allow_redirects=False)
+        if r.status_code in [200, 403, 401]: # 403/401 means it exists but is protected
+            return {"path": path, "status": r.status_code}
+        return None
+    except: return None
+
+def stage_2_web_audit(assets):
+    print(f"[+] Starting Web Security Audit (Fuzzing & Headers)...")
+    
+    for asset in assets:
+        if not asset["http_status"]: continue # Only audit web-active hosts
+        
+        scheme = "https" if "443" in str(asset.get("ip", "")) or asset.get("http_status") else "http"
+        base_url = f"https://{asset['host']}" # Try https first
+        
+        # Fuzz sensitive paths
+        found_files = []
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(check_sensitive_path, base_url, path): path for path in SENSITIVE_PATHS}
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    found_files.append(res)
+        
+        asset["sensitive_files"] = found_files
+        if found_files:
+            print(f"  -> {asset['host']}: Found {len(found_files)} interesting paths (e.g., {found_files[0]['path']}).")
+    
+    print(f"[+] Web Audit Complete.")
+    return assets
+
+# ==========================================
+# STAGE 3: ORIGIN PORT SCANNING
 # ==========================================
 def scan_port(ip, port):
     try:
@@ -134,12 +180,11 @@ def scan_port(ip, port):
     except: pass
     return None
 
-def stage_2_network_scan(assets):
+def stage_3_network_scan(assets):
     origin_assets = [a for a in assets if not a["is_cdn"]]
     cdn_assets = [a for a in assets if a["is_cdn"]]
     
-    print(f"[+] {len(cdn_assets)} assets behind CDN (skipping port scan).")
-    print(f"[+] {len(origin_assets)} Origin assets found. Scanning top ports...")
+    print(f"[+] {len(origin_assets)} Origin assets. Scanning top ports...")
     
     for asset in origin_assets:
         ip = asset["ip"]
@@ -152,9 +197,7 @@ def stage_2_network_scan(assets):
         asset["open_ports"] = sorted(open_ports) if open_ports else []
         if open_ports: print(f"  -> {asset['host']} ({ip}): Ports {open_ports}")
 
-    # Mark CDN assets as having unscanned ports
     for a in cdn_assets: a["open_ports"] = ["CDN Protected - Not Scanned"]
-        
     return origin_assets + cdn_assets
 
 # ==========================================
@@ -178,17 +221,18 @@ def call_gemini_with_retry(prompt):
             print(f"[-] Key #{i+1} failed: {str(e)}")
     raise Exception("All API keys exhausted.")
 
-def stage_3_ai_analysis(data):
+def stage_4_ai_analysis(data):
     print("[+] Running AI Stage 1: Evidence Extraction...")
-    prompt = f"""You are a strict, evidence-only Threat Intelligence Analyst. Analyze this raw scan data for '{TARGET}':
+    prompt = f"""You are an expert, strict, evidence-only Threat Intelligence Analyst. Analyze this raw scan data for '{TARGET}':
     {json.dumps(data, indent=2)}
     
     STRICT RULES:
-    1. DO NOT GUESS technologies. If the data only says "cloudflare", state "Cloudflare CDN". Do NOT invent "Tomcat" or "Jenkins" unless explicitly found in the technologies array.
-    2. ONLY flag open ports that are actually in the "open_ports" array.
-    3. If an asset is behind a CDN, note that it is protected and cannot be directly attacked via network ports.
-    4. Flag missing security headers as informational findings.
-    5. Map ONLY proven risks to MITRE ATT&CK.
+    1. DO NOT GUESS technologies or vulnerabilities.
+    2. Treat exposed sensitive files (.git/HEAD, .env, phpinfo.php, wp-login.php, admin panels, etc.) as security findings.
+    3. Treat missing security headers as informational findings.
+    4. Flag insecure cookies (missing Secure/HttpOnly) as vulnerabilities.
+    5. ONLY flag open ports that are actually in the "open_ports" array.
+    6. Map ONLY proven risks to MITRE ATT&CK and OWASP Top 10 (2021).
     
     Output strictly as JSON array:
     [
@@ -199,31 +243,31 @@ def stage_3_ai_analysis(data):
             "severity": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
             "mitre_tactic": "Tactic (TA####)",
             "mitre_technique": "Technique (T####)",
-            "evidence": "Exact proof from the data (e.g., 'Port 22 open', 'X-Powered-By: PHP')")
+            "owasp_category": "A01:2021 - Broken Access Control (if applicable)",
+            "evidence": "Exact proof from the data")
         }}
     ]"""
     return call_gemini_with_retry(prompt)
 
-def stage_4_ai_report(intel):
+def stage_5_ai_report(intel):
     print("[+] Running AI Stage 2: Final Report...")
     prompt = f"""You are a CISO reporting assistant. Take this evidence-based intelligence for '{TARGET}':
     {intel}
     
-    Write a professional Markdown report. 
-    CRITICAL: Base EVERY statement on the provided evidence. Do not hallucinate or guess technologies.
+    Write a professional Markdown report. Base EVERY statement on the provided evidence.
     
     Include:
-    1. 🎯 **Executive Summary:** (Risk score out of 100 based strictly on findings)
-    2. 🗺️ **Attack Surface Map:** Differentiate between CDN-protected assets and exposed Origin assets.
-    3. 🚨 **Findings Table:** Only include facts (actual open ports, detected tech, missing headers).
-    4. 🛡️ **MITRE ATT&CK Mapping:** Based ONLY on the evidence.
+    1. 🎯 **Executive Summary:** (Risk score out of 100)
+    2. 🗺️ **Attack Surface Map:** Differentiate between CDN-protected and Origin assets.
+    3. 🚨 **Critical Findings:** Exposed files, EOL tech, open admin ports.
+    4. 🛡️ **OWASP & MITRE Mapping:** Group findings strictly by OWASP Top 10 and MITRE ATT&CK.
     5. 🔧 **Remediation Steps:** Actionable advice based strictly on what was found."""
     return call_gemini_with_retry(intel)
 
 # ==========================================
 # DELIVERY & MAIN
 # ==========================================
-def stage_5_deliver(report):
+def stage_6_deliver(report):
     print("[+] Delivering report...")
     payload = {"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}
     try: requests.post(CALLBACK_URL, json=payload, timeout=30)
@@ -231,17 +275,27 @@ def stage_5_deliver(report):
 
 if __name__ == "__main__":
     print(f"=== OMNISCIENCE ENGINE STARTED ===")
+    
+    # Stage 1: Subdomains & Web Info
     assets = stage_1_recon(TARGET)
-    full_data = stage_2_network_scan(assets)
+    
+    # Stage 2: Web Security Audit (Fuzzing + Headers + Cookies)
+    assets = stage_2_web_audit(assets)
+    
+    # Stage 3: Network Origin Port Scan
+    full_data = stage_3_network_scan(assets)
     
     with open('./cache/raw_data.json', 'w') as f:
         json.dump({"target": TARGET, "assets": full_data}, f, indent=2)
     
-    intel = stage_3_ai_analysis(full_data)
+    # Stage 4: AI Analysis
+    intel = stage_4_ai_analysis(full_data)
     with open('./cache/processed_intel.json', 'w') as f: f.write(intel)
         
-    report = stage_4_ai_report(intel)
+    # Stage 5: AI Report
+    report = stage_5_ai_report(intel)
     with open('./cache/final_report.md', 'w') as f: f.write(report)
         
-    stage_5_deliver(report)
+    # Stage 6: Delivery
+    stage_6_deliver(report)
     print(f"=== OMNISCIENCE ENGINE COMPLETE ===")

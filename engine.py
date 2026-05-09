@@ -17,7 +17,7 @@ CALLBACK_URL = os.environ.get('CALLBACK_URL')
 API_KEYS = [os.environ.get(f'GEMINI_KEY_{i}') for i in range(1, 7)]
 FALSE_PATTERNS = [p.strip().upper() for p in os.environ.get('FALSE_PATTERNS', '').split(',') if p.strip()]
 
-# GITHUB ACTIONS SUMMARY LOGGING
+# GITHUB ACTIONS SUMMARY LOGING
 SUMMARY_FILE = os.environ.get('GITHUB_STEP_SUMMARY')
 def log_summary(text):
     print(text) # Keep console logging too
@@ -180,7 +180,6 @@ def stage_1_5_osint(t):
     log_summary(f"- Cloud Assets: **{len(ca)}** discovered.")
     return {"github_leaks": gh, "cloud_assets": ca}
 
-# NEW: DNS TXT Record Extraction
 def stage_1_8_dns_txt(target):
     log_summary("## 📜 Stage 1.8: DNS TXT Intelligence")
     txts = []
@@ -194,7 +193,7 @@ def stage_1_8_dns_txt(target):
     return txts
 
 # ==========================================
-# STAGE 2: WEB AUDIT
+# STAGE 2: WEB AUDIT (FIXED)
 # ==========================================
 def check_path(u, p):
     try:
@@ -255,9 +254,10 @@ def stage_2_web_audit(assets):
         a["data_leaks"] = check_error_leaks(b)
         total_leaks += len(a["data_leaks"])
         
-    log_summary(f "Exposed Paths: **{total_paths}**")
-    log_summary(f "Open Redirects: **{total_redirs}**")
-    log_summary(f "Error/Injection Leaks: **{total_leaks}**")
+    # FIXED TYPO HERE: f"- ..." changed to f"..."
+    log_summary(f"- Exposed Paths: **{total_paths}**")
+    log_summary(f"- Open Redirects: **{total_redirs}**")
+    log_summary(f"- Error/Injection Leaks: **{total_leaks}**")
     return assets
 
 # ==========================================
@@ -428,12 +428,12 @@ def deliver(report):
     log_summary("- ✅ Sent to Google Apps Script.")
 
 if __name__ == "__main__":
-    log_summary(f"# 🛡️ OMNISCIENCE v3.2 Scan: `{TARGET}`")
+    log_summary(f"# 🛡️ OMNISCIENCE v3.2.1 Scan: `{TARGET}`")
     log_summary(f"Started at: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n---")
     
     assets = stage_1_recon(TARGET)
     osint = stage_1_5_osint(TARGET)
-    txts = stage_1_8_dns_txt(TARGET) # NEW
+    txts = stage_1_8_dns_txt(TARGET)
     assets = stage_2_web_audit(assets)
     assets = stage_2_5_history_and_secrets(assets, TARGET)
     takeovers = stage_2_8_takeover_scan(assets)

@@ -17,6 +17,15 @@ CALLBACK_URL = os.environ.get('CALLBACK_URL')
 API_KEYS = [os.environ.get(f'GEMINI_KEY_{i}') for i in range(1, 7)]
 FALSE_PATTERNS = [p.strip().upper() for p in os.environ.get('FALSE_PATTERNS', '').split(',') if p.strip()]
 
+# GITHUB ACTIONS SUMMARY LOGGING
+SUMMARY_FILE = os.environ.get('GITHUB_STEP_SUMMARY')
+def log_summary(text):
+    print(text) # Keep console logging too
+    if SUMMARY_FILE:
+        try:
+            with open(SUMMARY_FILE, 'a') as f: f.write(text + "\n")
+        except: pass
+
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
 CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'awselb', 'fastly']
 SENSITIVE_PATHS = ['/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php', '/phpinfo.php', '/admin', '/robots.txt', '/sitemap.xml', '/server-status', '/config.yml', '/package.json']
@@ -34,7 +43,6 @@ SECRET_PATTERNS = {
     "Generic Secret": r"(?:secret_key|api_key|password)\s*[:=]\s*['\"][^'\"]{8,}['\"]"
 }
 
-# Subdomain Takeover Fingerprints
 TAKEOVER_FINGERPRINTS = {
     "aws_s3": ["NoSuchBucket", "The specified bucket does not exist"],
     "heroku": ["No such app", "herokucdn"],
@@ -91,40 +99,33 @@ def probe_subdomain(sub):
         try:
             r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
             res["http_status"] = r.status_code
-            
             if "<title>" in r.text.lower():
                 s = r.text.lower().find("<title>") + 7; e = r.text.lower().find("</title>", s)
                 res["title"] = r.text[s:e].strip()[:100]
-            
             server = r.headers.get("Server", "Unknown")
             res["server"] = server
             if any(cdn in server.lower() for cdn in CDN_SERVERS): res["is_cdn"] = True
-            
             techs = []
             if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
             if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
             res["technologies"] = techs
-            
             res["missing_headers"] = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
             res["hidden_api_endpoints"] = list(set(re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin)/[^"\']*)(?:["\'])', r.text)))[:10]
             res["js_files"] = [requests.compat.urljoin(f"{scheme}://{sub}", link) for link in re.findall(r'(?:src=["\'])([^"\']+\.js(?:\?[^"\']*)?)', r.text)[:5]]
-            
-            # RESTORED: Cookie Security Checks
             bad_cookies = []
             for cookie in r.cookies:
                 if not cookie.secure: bad_cookies.append(f"Cookie '{cookie.name}' missing Secure flag")
                 if not cookie.has_nonstandard_attr('httponly'): bad_cookies.append(f"Cookie '{cookie.name}' missing HttpOnly")
             res["cookie_issues"] = bad_cookies
-            
             break
         except: continue
     return res
 
 def stage_1_recon(target):
-    print(f"[+] Starting Deep Recon on {target}...")
+    log_summary(f"## 🔎 Stage 1: Deep Recon on `{target}`")
     subs = fetch_crtsh(target) | fetch_hackertarget(target)
     subs.add(target)
-    print(f"[+] Found {len(subs)} unique subdomains.")
+    log_summary(f"- 📡 Found **{len(subs)}** unique subdomains from APIs.")
     alive = []
     with ThreadPoolExecutor(max_workers=25) as ex:
         futs = {ex.submit(probe_subdomain, s): s for s in subs}
@@ -133,14 +134,13 @@ def stage_1_recon(target):
                 r = f.result()
                 if r["ip"]: alive.append(r)
             except: pass
-    print(f"[+] {len(alive)} hosts alive.")
+    log_summary(f"- ✅ **{len(alive)}** hosts alive and responding.")
     return alive
 
 # ==========================================
 # STAGE 1.5: OSINT
 # ==========================================
 def github_secret_dorking(t):
-    print(f"[+] GitHub OSINT...")
     leaks = []
     for q in [f'"{t}" password', f'"{t}" .env', f'"{t}" api_key']:
         try:
@@ -152,7 +152,6 @@ def github_secret_dorking(t):
     return leaks
 
 def discover_cloud_assets(t):
-    print(f"[+] Cloud Asset Probing...")
     org = t.split('.')[0]
     perms = [f"{org}-backup", f"{org}-dev", f"{org}-staging", f"{org}-bucket", t.replace('.', '-')]
     exposed = []
@@ -173,10 +172,29 @@ def discover_cloud_assets(t):
             if res: exposed.append(res)
     return exposed
 
-def stage_1_5_osint(t): return {"github_leaks": github_secret_dorking(t), "cloud_assets": discover_cloud_assets(t)}
+def stage_1_5_osint(t):
+    log_summary("## 🕵️ Stage 1.5: Passive OSINT")
+    gh = github_secret_dorking(t)
+    ca = discover_cloud_assets(t)
+    log_summary(f"- GitHub Leaks: **{len(gh)}** found.")
+    log_summary(f"- Cloud Assets: **{len(ca)}** discovered.")
+    return {"github_leaks": gh, "cloud_assets": ca}
+
+# NEW: DNS TXT Record Extraction
+def stage_1_8_dns_txt(target):
+    log_summary("## 📜 Stage 1.8: DNS TXT Intelligence")
+    txts = []
+    try:
+        r = requests.get(f"https://dns.google/resolve?name={target}&type=TXT", timeout=5)
+        if r.status_code == 200:
+            for ans in r.json().get("Answer", []):
+                txts.append(ans.get("data", ""))
+    except: pass
+    log_summary(f"- Extracted **{len(txts)}** TXT records (SPF, Domain Verifications, etc.).")
+    return txts
 
 # ==========================================
-# STAGE 2: WEB AUDIT (FULLY RESTORED)
+# STAGE 2: WEB AUDIT
 # ==========================================
 def check_path(u, p):
     try:
@@ -195,10 +213,9 @@ def check_cors(u):
         r = requests.get(u, headers={"Origin": "https://evil.com"}, timeout=4, verify=False)
         acao = r.headers.get("Access-Control-Allow-Origin", "")
         if "evil.com" in acao and r.headers.get("Access-Control-Allow-Credentials", "").lower() == "true":
-            return {"issue": "CORS Misconfiguration (Allows evil.com with Credentials)"}
+            return {"issue": "CORS Misconfiguration"}
     except: pass
 
-# RESTORED: Error Leak Provocation
 def check_error_leaks(u):
     leaks = []
     for p in ["'", "{{7*7}}"]:
@@ -211,17 +228,20 @@ def check_error_leaks(u):
     return leaks
 
 def stage_2_web_audit(assets):
-    print(f"[+] Web Audit...")
+    log_summary("## 🌐 Stage 2: Web Vulnerability Audit")
+    total_paths = 0
+    total_redirs = 0
+    total_leaks = 0
     for a in assets:
         if not a["http_status"]: continue
         b = f"https://{a['host']}"
-        
         found = []
         with ThreadPoolExecutor(max_workers=20) as ex:
             for f in as_completed([ex.submit(check_path, b, p) for p in SENSITIVE_PATHS + ADVANCED_ENDPOINTS]):
                 res = f.result()
                 if res: found.append(res)
         a["sensitive_files"] = found
+        total_paths += len(found)
         
         redirs = []
         with ThreadPoolExecutor(max_workers=10) as ex:
@@ -229,16 +249,21 @@ def stage_2_web_audit(assets):
                 res = f.result()
                 if res: redirs.append(res)
         a["open_redirects"] = redirs
+        total_redirs += len(redirs)
         
         a["cors_issue"] = check_cors(b)
-        a["data_leaks"] = check_error_leaks(b) # RESTORED
+        a["data_leaks"] = check_error_leaks(b)
+        total_leaks += len(a["data_leaks"])
+        
+    log_summary(f- "Exposed Paths: **{total_paths}**")
+    log_summary(f- "Open Redirects: **{total_redirs}**")
+    log_summary(f- "Error/Injection Leaks: **{total_leaks}**")
     return assets
 
 # ==========================================
 # STAGE 2.5: HISTORY & JS SECRETS
 # ==========================================
 def fetch_wayback_urls(target):
-    print(f"[+] Wayback Machine history...")
     interesting_paths = set()
     try:
         r = requests.get(f"http://web.archive.org/cdx/search/cdx?url=*.{target}/*&output=json&fl=original,timestamp,statuscode&limit=200", timeout=15)
@@ -248,11 +273,9 @@ def fetch_wayback_urls(target):
                 if any(kw in path.lower() for kw in ['admin', 'api', 'config', 'login', 'dashboard', 'upload', 'db', 'user', 'env']):
                     interesting_paths.add(path)
     except: pass
-    print(f"[+] Wayback found {len(interesting_paths)} interesting historical endpoints.")
     return list(interesting_paths)[:30]
 
 def extract_js_secrets(js_urls):
-    print(f"[+] Analyzing {len(js_urls)} JS files for secrets...")
     found_secrets = []
     for url in js_urls:
         try:
@@ -264,7 +287,11 @@ def extract_js_secrets(js_urls):
     return found_secrets
 
 def stage_2_5_history_and_secrets(assets, target):
+    log_summary("## ⏳ Stage 2.5: Wayback History & JS Secrets")
     historical_paths = fetch_wayback_urls(target)
+    log_summary(f"- Wayback Machine found **{len(historical_paths)}** interesting historical endpoints.")
+    total_hist = 0
+    total_js = 0
     for a in assets:
         if not a["http_status"]: continue
         b = f"https://{a['host']}"
@@ -274,35 +301,35 @@ def stage_2_5_history_and_secrets(assets, target):
                 res = f.result()
                 if res and res["status"] == 200: found_hist.append(res)
         a["historical_endpoints"] = found_hist
+        total_hist += len(found_hist)
+        
         a["js_secrets"] = extract_js_secrets(a.get("js_files", []))
+        total_js += len(a["js_secrets"])
+        
+    log_summary(f"- Alive Historical Endpoints: **{total_hist}**")
+    log_summary(f"- Hardcoded Secrets in JS: **{total_js}**")
     return assets
 
 # ==========================================
-# STAGE 2.8: SUBDOMAIN TAKEOVER (NEW!)
+# STAGE 2.8: SUBDOMAIN TAKEOVER
 # ==========================================
 def check_takeover(sub):
     try:
-        # 1. Get CNAME using Google Public DNS API
         r = requests.get(f"https://dns.google/resolve?name={sub}&type=CNAME", timeout=5)
         if r.status_code == 200:
-            data = r.json()
-            answers = data.get("Answer", [])
-            for ans in answers:
+            for ans in r.json().get("Answer", []):
                 cname = ans.get("data", "").lower()
                 if cname:
-                    # 2. Check if CNAME points to a known cloud provider
                     vulnerable_provider = None
                     if "s3.amazonaws.com" in cname: vulnerable_provider = "aws_s3"
                     elif "herokuapp.com" in cname: vulnerable_provider = "heroku"
                     elif "myshopify.com" in cname: vulnerable_provider = "shopify"
                     elif "github.io" in cname: vulnerable_provider = "github"
-                    elif "pantheon.io" in cname: vulnerable_provider = "pantheon"
                     elif "zendesk.com" in cname: vulnerable_provider = "zendesk"
                     elif "tumblr.com" in cname: vulnerable_provider = "tumblr"
                     elif "wordpress.com" in cname: vulnerable_provider = "wordpress"
                     
                     if vulnerable_provider:
-                        # 3. Fetch the page and look for takeover error fingerprints
                         try:
                             web_r = requests.get(f"http://{sub}", timeout=5, verify=False)
                             for fp in TAKEOVER_FINGERPRINTS.get(vulnerable_provider, []):
@@ -313,15 +340,14 @@ def check_takeover(sub):
     return None
 
 def stage_2_8_takeover_scan(assets):
-    print(f"[+] Checking for Subdomain Takeovers...")
+    log_summary("## 💀 Stage 2.8: Subdomain Takeover Detection")
     takeovers = []
     with ThreadPoolExecutor(max_workers=20) as ex:
         futs = {ex.submit(check_takeover, a["host"]): a["host"] for a in assets if a["ip"]}
         for f in as_completed(futs):
             res = f.result()
-            if res: 
-                takeovers.append(res)
-                print(f"[!] TAKEOVER FOUND: {res['subdomain']} -> {res['provider']}")
+            if res: takeovers.append(res)
+    log_summary(f"- Potential Takeovers: **{len(takeovers)}**")
     return takeovers
 
 # ==========================================
@@ -335,9 +361,11 @@ def scan_port(ip, port):
     except: pass
 
 def stage_3_network_scan(assets):
+    log_summary("## 🔌 Stage 3: Network Port Scanning")
     origins = [a for a in assets if not a["is_cdn"]]
     cdns = [a for a in assets if a["is_cdn"]]
-    print(f"[+] Scanning {len(origins)} origin IPs...")
+    log_summary(f"- Scanning **{len(origins)}** Origin IPs (CDN skipped).")
+    total_ports = 0
     for a in origins:
         ports = []
         with ThreadPoolExecutor(max_workers=50) as ex:
@@ -345,12 +373,14 @@ def stage_3_network_scan(assets):
                 res = f.result()
                 if res: ports.append(res)
         a["open_ports"] = sorted(ports) if ports else []
+        total_ports += len(ports)
     for c in cdns: c["open_ports"] = ["CDN Protected"]
+    log_summary(f"- Open Ports Found: **{total_ports}**")
     return origins + cdns
 
 def apply_memory_filter(assets):
     if not FALSE_PATTERNS: return assets
-    print(f"[+] Memory Filter active: {FALSE_PATTERNS}")
+    log_summary(f"## 🧠 Memory Filter Active: Ignoring `{FALSE_PATTERNS}`")
     for a in assets:
         a["sensitive_files"] = [f for f in a.get("sensitive_files", []) if not any(fp in json.dumps(f).upper() for fp in FALSE_PATTERNS)]
         a["data_leaks"] = [l for l in a.get("data_leaks", []) if not any(fp in json.dumps(l).upper() for fp in FALSE_PATTERNS)]
@@ -367,61 +397,54 @@ def call_gemini(prompt, key):
 def call_gemini_retry(prompt):
     keys = [k for k in API_KEYS if k]; random.shuffle(keys)
     for i, k in enumerate(keys):
-        try: print(f"[+] Gemini Key #{i+1}"); return call_gemini(prompt, k)
-        except Exception as e: print(f"[-] Fail: {e}")
+        try: log_summary(f"🤖 Gemini Key #{i+1} active..."); return call_gemini(prompt, k)
+        except Exception as e: log_summary(f"❌ Key #{i+1} failed: {e}")
     raise Exception("Keys dead")
 
-def stage_4_ai(data, osint, takeovers):
-    print("[+] AI Stage 1...")
+def stage_4_ai(data, osint, takeovers, txts):
+    log_summary("## 🧠 Stage 4: AI Threat Analysis")
     prompt = f"""You are a Tier-1 Red Team Operator. Analyze this data for '{TARGET}':
-    --- NETWORK & WEB --- 
-    {json.dumps(data, indent=2)}
-    --- OSINT ---
-    {json.dumps(osint, indent=2)}
-    --- SUBDOMAIN TAKEOVERS ---
-    {json.dumps(takeovers, indent=2)}
-    
-    STRICT RULES: DO NOT GUESS. 
-    If Takeovers found -> CRITICAL. Explain exactly how to claim the DNS.
-    If GitHub leaks/Cloud assets found -> CRITICAL. 
-    If hardcoded JS secrets found -> CRITICAL. 
-    If historical endpoints (admin/login) are alive -> HIGH. 
-    For SSTI/SQLi data leaks, explain the payload used.
-    Map to OWASP/MITRE.
+    --- NETWORK & WEB --- {json.dumps(data, indent=2)}
+    --- OSINT --- {json.dumps(osint, indent=2)}
+    --- TAKEOVERS --- {json.dumps(takeovers, indent=2)}
+    --- DNS TXT --- {json.dumps(txts, indent=2)}
+    STRICT RULES: DO NOT GUESS. Takeovers -> CRITICAL. GitHub/Cloud/JS secrets -> CRITICAL. Historical endpoints -> HIGH. SSTI/SQLi -> Explain payload. Map to OWASP/MITRE.
     Output strictly as JSON array: [{{"asset": "...", "what_was_found": "...", "why_its_vulnerable": "...", "how_to_exploit": "...", "severity": "...", "owasp": "...", "mitre": "..."}}]"""
-    return call_gemini_retry(prompt)
+    intel = call_gemini_retry(prompt)
+    log_summary("- ✅ Threat Extraction Complete.")
+    return intel
 
 def stage_5_report(intel):
-    print("[+] AI Stage 2...")
+    log_summary("## 📝 Stage 5: AI Report Generation")
     prompt = f"""You are a CISO assistant. Format this intel for '{TARGET}': {intel}
-    Markdown report with: 
-    1. 🎯 Exec Summary (Risk /100). 
-    2. ☣️ OSINT/Leaks/JS Secrets (CRITICAL). 
-    3. 💀 Subdomain Takeovers (CRITICAL - Provide step-by-step how an attacker would steal it).
-    4. 🗺️ Attack Map. 
-    5. 🚨 Vulns (Include Historical Endpoints, SSTI/SQLi probes, CORS, Cookies). 
-    6. 🛡️ OWASP/MITRE. 
-    7. 🔧 Fixes."""
-    return call_gemini_retry(intel)
+    Markdown report with: 1. 🎯 Exec Summary (Risk /100). 2. ☣️ OSINT/Leaks/JS Secrets. 3. 💀 Takeovers. 4. 🗺️ Attack Map. 5. 🚨 Vulns (History, SSTI, CORS, Cookies). 6. 🛡️ OWASP/MITRE. 7. 🔧 Fixes."""
+    report = call_gemini_retry(prompt)
+    log_summary("- ✅ Report Generated.")
+    return report
 
 def deliver(report):
-    print("[+] Delivering...")
+    log_summary("## 🚀 Stage 6: Delivery")
     requests.post(CALLBACK_URL, json={"action": "delivery", "target": TARGET, "chat_id": CHAT_ID, "report": report}, timeout=30)
+    log_summary("- ✅ Sent to Google Apps Script.")
 
 if __name__ == "__main__":
-    print(f"=== OMNISCIENCE v3.1 (Takeover Edition) STARTED ===")
+    log_summary(f"# 🛡️ OMNISCIENCE v3.2 Scan: `{TARGET}`")
+    log_summary(f"Started at: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n---")
+    
     assets = stage_1_recon(TARGET)
     osint = stage_1_5_osint(TARGET)
-    assets = stage_2_web_audit(assets) # RESTORED fully
+    txts = stage_1_8_dns_txt(TARGET) # NEW
+    assets = stage_2_web_audit(assets)
     assets = stage_2_5_history_and_secrets(assets, TARGET)
-    takeovers = stage_2_8_takeover_scan(assets) # NEW
+    takeovers = stage_2_8_takeover_scan(assets)
     full = stage_3_network_scan(assets)
     full = apply_memory_filter(full)
     
-    with open('./cache/raw.json', 'w') as f: json.dump({"target": TARGET, "assets": full, "osint": osint, "takeovers": takeovers}, f, indent=2)
-    intel = stage_4_ai(full, osint, takeovers)
+    with open('./cache/raw.json', 'w') as f: json.dump({"target": TARGET, "assets": full, "osint": osint, "takeovers": takeovers, "txts": txts}, f, indent=2)
+    intel = stage_4_ai(full, osint, takeovers, txts)
     with open('./cache/intel.json', 'w') as f: f.write(intel)
     report = stage_5_report(intel)
     with open('./cache/report.md', 'w') as f: f.write(report)
     deliver(report)
-    print(f"=== OMNISCIENCE COMPLETE ===")
+    
+    log_summary("\n---\n🟢 **SCAN COMPLETE**")

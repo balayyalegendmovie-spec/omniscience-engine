@@ -5,6 +5,7 @@ import requests
 import socket
 import urllib3
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -25,27 +26,17 @@ CDN_SERVERS = ['cloudflare', 'akamai', 'sucuri', 'incapsula', 'cloudfront', 'aws
 SENSITIVE_PATHS = [
     '/.git/HEAD', '/.env', '/.svn/entries', '/wp-config.php', '/wp-login.php',
     '/phpinfo.php', '/admin', '/admin/login', '/robots.txt', '/sitemap.xml',
-    '/server-status', '/.htaccess', '/config.yml', '/package.json',
-    '/.DS_Store', '/backup.sql', '/.well-known/security.txt'
+    '/server-status', '/.htaccess', '/config.yml', '/package.json', '/.DS_Store'
 ]
 
-# NEW: Advanced Vulnerability Endpoints
 ADVANCED_ENDPOINTS = [
-    '/api/v1', '/api/v2', '/api/docs', '/swagger-ui.html', '/swagger.json', 
-    '/openapi.json', '/graphql', '/graphiql', '/actuator/health', '/actuator/env',
-    '/actuator/trace', '/wp-json/wp/v2/users', '/?rest_route=/wp/v2/users',
-    '/console', '/debug', '/trace', '/.well-known/openid-configuration',
-    '/api/users', '/api/admin', '/telemetry', '/metrics'
+    '/api/v1', '/swagger-ui.html', '/swagger.json', '/openapi.json', 
+    '/graphql', '/actuator/health', '/actuator/env',
+    '/wp-json/wp/v2/users', '/console', '/debug'
 ]
 
-# NEW: Parameters often vulnerable to Open Redirect / SSRF / LFI
-REDIRECT_PARAMS = ['url', 'redirect', 'next', 'continue', 'return', 'dest', 'target', 'redir', 'rurl']
-
-SECURITY_HEADERS = [
-    'Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy',
-    'X-Content-Type-Options', 'Referrer-Policy', 'Permissions-Policy',
-    'X-XSS-Protection', 'Feature-Policy', 'Cross-Origin-Opener-Policy'
-]
+REDIRECT_PARAMS = ['url', 'redirect', 'next', 'continue', 'return', 'dest', 'target']
+SECURITY_HEADERS = ['Strict-Transport-Security', 'X-Frame-Options', 'Content-Security-Policy', 'X-Content-Type-Options']
 
 # ==========================================
 # STAGE 1: DEEP RECON
@@ -82,9 +73,8 @@ def probe_subdomain(sub):
         "host": sub, "ip": None, "is_cdn": False, "cdn_provider": None,
         "http_status": None, "title": None, "server": None, 
         "technologies": [], "missing_headers": [], "cookie_issues": [],
-        "sensitive_files": [], "hidden_api_endpoints": [], "html_size": 0
+        "sensitive_files": [], "hidden_api_endpoints": []
     }
-    
     ip = resolve_dns(sub)
     if not ip: return result
     result["ip"] = ip
@@ -93,7 +83,6 @@ def probe_subdomain(sub):
         try:
             r = requests.get(f"{scheme}://{sub}", timeout=5, verify=False, allow_redirects=True)
             result["http_status"] = r.status_code
-            
             if "<title>" in r.text.lower():
                 s = r.text.lower().find("<title>") + 7
                 e = r.text.lower().find("</title>", s)
@@ -108,24 +97,13 @@ def probe_subdomain(sub):
             techs = []
             if r.headers.get("X-Powered-By"): techs.append(f"X-Powered-By: {r.headers.get('X-Powered-By')}")
             if r.headers.get("X-AspNet-Version"): techs.append(f"ASP.NET: {r.headers.get('X-AspNet-Version')}")
-            if "wordpress" in r.text.lower()[:2000]: techs.append("WordPress Detected")
             result["technologies"] = techs
             
             missing = [h for h in SECURITY_HEADERS if h.lower() not in [k.lower() for k in r.headers.keys()]]
             result["missing_headers"] = missing
             
-            bad_cookies = []
-            for cookie in r.cookies:
-                if not cookie.secure: bad_cookies.append(f"Cookie '{cookie.name}' missing Secure flag")
-                if not cookie.has_nonstandard_attr('httponly'): bad_cookies.append(f"Cookie '{cookie.name}' missing HttpOnly")
-            result["cookie_issues"] = bad_cookies
-
-            # NEW: Extract hidden endpoints from JavaScript/HTML
-            api_patterns = re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin|user|upload)/[^"\']*)(?:["\'])', r.text)
-            if api_patterns:
-                result["hidden_api_endpoints"] = list(set(api_patterns))[:10] # Top 10 unique
-                
-            result["html_size"] = len(r.content)
+            api_patterns = re.findall(r'(?:["\'])(/(?:api|v[0-9]|graphql|rest|auth|admin|user)/[^"\']*)(?:["\'])', r.text)
+            if api_patterns: result["hidden_api_endpoints"] = list(set(api_patterns))[:10]
             break
         except: continue
     return result
@@ -135,7 +113,6 @@ def stage_1_recon(target):
     subs = fetch_crtsh(target) | fetch_hackertarget(target)
     if target in subs: subs.add(target)
     print(f"[+] Found {len(subs)} unique subdomains.")
-    
     alive_assets = []
     with ThreadPoolExecutor(max_workers=25) as executor:
         futures = {executor.submit(probe_subdomain, sub): sub for sub in subs}
@@ -148,53 +125,136 @@ def stage_1_recon(target):
     return alive_assets
 
 # ==========================================
-# STAGE 2: ADVANCED VULNERABILITY AUDIT
+# STAGE 1.5: DEEP OSINT (NEW!)
+# ==========================================
+def github_secret_dorking(target):
+    """Search GitHub for hardcoded secrets belonging to the target"""
+    print(f"[+] Running GitHub OSINT for {target}...")
+    queries = [
+        f'"{target}" password',
+        f'"{target}" api_key',
+        f'"{target}" .env',
+        f'"{target}" secret_key',
+        f'"{target}" connection_string'
+    ]
+    
+    leaked_data = []
+    for query in queries:
+        try:
+            r = requests.get(
+                "https://api.github.com/search/code",
+                params={"q": query, "per_page": 5},
+                headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "OMNISCIENCE-Engine"},
+                timeout=15
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("total_count", 0) > 0:
+                    for item in data.get("items", []):
+                        leaked_data.append({
+                            "file": item.get("path"),
+                            "repo": item.get("repository", {}).get("full_name"),
+                            "url": item.get("html_url"),
+                            "query_used": query
+                        })
+            time.sleep(3)  # Respect GitHub unauthenticated rate limits (10 req/min)
+        except: pass
+    
+    if leaked_data: print(f"[+] WARNING: Found {len(leaked_data)} potential code leaks on GitHub!")
+    else: print(f"[+] GitHub OSINT clean. No obvious leaks found.")
+    return leaked_data
+
+def discover_cloud_assets(target):
+    """Check for publicly exposed S3, Firebase, and GCS buckets"""
+    print(f"[+] Probing Cloud Assets for {target}...")
+    org_name = target.split('.')[0]
+    
+    permutations = [
+        f"{org_name}-backup", f"{org_name}-dev", f"{org_name}-staging",
+        f"{org_name}-old", f"{org_name}-bucket", f"{target.replace('.', '-')}",
+        f"{target}-logs", f"{org_name}-assets", f"{org_name}-data"
+    ]
+    
+    exposed_assets = []
+    
+    def check_s3(perm):
+        url = f"http://{perm}.s3.amazonaws.com"
+        try:
+            r = requests.get(url, timeout=4)
+            if r.status_code == 200:
+                return {"type": "AWS S3 (PUBLIC READ)", "url": url, "severity": "CRITICAL", "evidence": "Bucket contents listable"}
+            elif r.status_code == 403:
+                return {"type": "AWS S3 (EXISTS)", "url": url, "severity": "INFO", "evidence": "Bucket exists but access denied"}
+        except: pass
+        return None
+
+    def check_firebase(perm):
+        url = f"https://{perm}.firebaseio.com/.json"
+        try:
+            r = requests.get(url, timeout=4)
+            if r.status_code == 200 and r.text != "null":
+                return {"type": "Firebase DB (PUBLIC)", "url": url, "severity": "CRITICAL", "evidence": "Database readable"}
+        except: pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        s3_futures = {executor.submit(check_s3, p): p for p in permutations}
+        fb_futures = {executor.submit(check_firebase, p): p for p in permutations}
+        
+        for future in as_completed(s3_futures):
+            res = future.result()
+            if res: exposed_assets.append(res)
+        for future in as_completed(fb_futures):
+            res = future.result()
+            if res: exposed_assets.append(res)
+
+    if exposed_assets: print(f"[+] WARNING: Found {len(exposed_assets)} exposed cloud assets!")
+    else: print(f"[+] Cloud assets secure.")
+    return exposed_assets
+
+def stage_1_5_osint(target):
+    """Run all passive OSINT checks"""
+    return {
+        "github_leaks": github_secret_dorking(target),
+        "cloud_assets": discover_cloud_assets(target)
+    }
+
+# ==========================================
+# STAGE 2: WEB AUDIT
 # ==========================================
 def check_path(base_url, path):
     try:
         r = requests.get(f"{base_url}{path}", timeout=4, verify=False, allow_redirects=False)
         if r.status_code in [200, 403, 401, 405]:
             return {"path": path, "status": r.status_code, "size": len(r.content)}
-        return None
-    except: return None
+    except: pass
+    return None
 
 def check_open_redirect(base_url, param):
     try:
-        payload = f"https://evil.com"
-        r = requests.get(f"{base_url}/?{param}={payload}", timeout=4, verify=False, allow_redirects=False)
-        # Check if it redirects to our evil payload
-        if r.status_code in [301, 302, 303, 307, 308]:
-            location = r.headers.get('Location', '')
-            if "evil.com" in location:
-                return {"parameter": param, "redirect_url": location}
-        return None
-    except: return None
+        r = requests.get(f"{base_url}/?{param}=https://evil.com", timeout=4, verify=False, allow_redirects=False)
+        if r.status_code in [301, 302, 303, 307, 308] and "evil.com" in r.headers.get('Location', ''):
+            return {"parameter": param, "redirect_url": r.headers['Location']}
+    except: pass
+    return None
 
 def check_error_leaks(base_url):
     leaks = []
-    payloads = ["'", "{{7*7}}", "<h1>xss</h1>"]
-    try:
-        for p in payloads:
+    for p in ["'", "{{7*7}}"]:
+        try:
             r = requests.get(f"{base_url}/?id={p}", timeout=4, verify=False)
             text = r.text.lower()
-            if "sql syntax" in text or "mysql_" in text or "pgsql" in text:
-                leaks.append({"type": "SQL Error Leak", "payload": p})
-            elif "49" in r.text and p == "{{7*7}}": # 7*7 = 49
-                leaks.append({"type": "SSTI Detected (49)", "payload": p})
-            elif "<h1>xss</h1>" in text.lower():
-                leaks.append({"type": "Reflected XSS (No Filter)", "payload": p})
-            if leaks: break # One leak is enough to prove the point
-    except: pass
+            if "sql syntax" in text or "mysql_" in text: leaks.append({"type": "SQL Error Leak", "payload": p})
+            elif "49" in r.text and p == "{{7*7}}": leaks.append({"type": "SSTI Detected", "payload": p})
+        except: pass
     return leaks
 
 def stage_2_web_audit(assets):
     print(f"[+] Starting Advanced Vulnerability Audit...")
-    
     for asset in assets:
         if not asset["http_status"]: continue
         base_url = f"https://{asset['host']}"
         
-        # 1. Fuzz Sensitive Files + Advanced API Endpoints
         all_paths = SENSITIVE_PATHS + ADVANCED_ENDPOINTS
         found_files = []
         with ThreadPoolExecutor(max_workers=20) as executor:
@@ -204,7 +264,6 @@ def stage_2_web_audit(assets):
                 if res: found_files.append(res)
         asset["sensitive_files"] = found_files
         
-        # 2. Open Redirect Checks
         open_redirects = []
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(check_open_redirect, base_url, param): param for param in REDIRECT_PARAMS}
@@ -213,17 +272,11 @@ def stage_2_web_audit(assets):
                 if res: open_redirects.append(res)
         asset["open_redirects"] = open_redirects
         
-        # 3. Error/Leak Provocation
         asset["data_leaks"] = check_error_leaks(base_url)
-        
-        if found_files or open_redirects or asset["data_leaks"]:
-            print(f"  -> {asset['host']}: Vulns found! {len(found_files)} endpoints, {len(open_redirects)} redirects, {len(asset['data_leaks'])} leaks.")
-    
-    print(f"[+] Advanced Audit Complete.")
     return assets
 
 # ==========================================
-# STAGE 3: ORIGIN PORT SCANNING
+# STAGE 3: PORT SCANNING
 # ==========================================
 def scan_port(ip, port):
     try:
@@ -251,7 +304,7 @@ def stage_3_network_scan(assets):
     return origin_assets + cdn_assets
 
 # ==========================================
-# AI STAGES (How & Why Analysis)
+# AI STAGES
 # ==========================================
 def call_gemini(prompt, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
@@ -271,30 +324,32 @@ def call_gemini_with_retry(prompt):
             print(f"[-] Key #{i+1} failed: {str(e)}")
     raise Exception("All API keys exhausted.")
 
-def stage_4_ai_analysis(data):
-    print("[+] Running AI Stage 1: Vulnerability Evidence Extraction...")
-    prompt = f"""You are a Tier-1 Red Team Operator. Analyze this raw scan data for '{TARGET}':
+def stage_4_ai_analysis(data, osint_data):
+    print("[+] Running AI Stage 1: Vulnerability & OSINT Extraction...")
+    prompt = f"""You are a Tier-1 Red Team Operator. Analyze this raw scan data AND OSINT data for '{TARGET}':
+
+    --- NETWORK & WEB DATA ---
     {json.dumps(data, indent=2)}
+
+    --- OSINT & LEAK DATA ---
+    {json.dumps(osint_data, indent=2)}
     
     STRICT RULES:
     1. DO NOT GUESS. Base everything on the provided evidence.
-    2. For EVERY finding, you MUST provide:
-       - **what_was_found**: The exact URL/Port/Header.
-       - **why_its_vulnerable**: The technical flaw (e.g., "Server blindly redirects to attacker-controlled URL without validation").
-       - **how_to_exploit**: Brief scenario (e.g., "Attacker sends link to user; user clicks and is redirected to a fake login page to steal credentials").
-    3. Flag exposed API docs (/swagger, /graphql, /openapi) as HIGH severity.
-    4. Flag Open Redirects as MEDIUM/HIGH.
-    5. Flag SQL/SSTI/XSS error leaks as CRITICAL/HIGH.
+    2. If GitHub leaks are found, treat them as CRITICAL. Explain exactly what was leaked (e.g., "Hardcoded database credentials found in .env file").
+    3. If public Cloud assets (S3/Firebase) are found, treat them as CRITICAL.
+    4. For web findings, explain What, Why, and How to exploit.
+    5. Map ONLY proven risks to MITRE ATT&CK and OWASP Top 10.
     
     Output strictly as JSON array:
     [
         {{
-            "asset": "subdomain.target.com",
-            "what_was_found": "e.g., /swagger-ui.html returned 200",
-            "why_its_vulnerable": "e.g., Exposes API schema allowing attackers to understand internal logic.",
-            "how_to_exploit": "e.g., Attacker reads schema -> crafts valid API request to /api/admin/delete",
+            "asset": "subdomain.target.com or GitHub/Cloud",
+            "what_was_found": "Exact description",
+            "why_its_vulnerable": "Technical flaw",
+            "how_to_exploit": "Brief scenario",
             "severity": "CRITICAL/HIGH/MEDIUM/LOW/INFO",
-            "owasp_category": "e.g., A01:2021 - Broken Access Control",
+            "owasp_category": "e.g., A01:2021",
             "mitre_technique": "e.g., T1190"
         }}
     ]"""
@@ -306,14 +361,12 @@ def stage_5_ai_report(intel):
     {intel}
     
     Write a highly detailed, professional Markdown report. Include:
-    1. 🎯 **Executive Summary:** (Risk score out of 100, overview of real threats).
-    2. 🗺️ **Attack Surface Map:** Summary of assets, CDN protection, and exposed ports.
-    3. 🚨 **Vulnerable Endpoints & Exploitability:** Group by severity. For each, explain:
-       - **What was found**
-       - **Why it is vulnerable** 
-       - **How an attacker exploits it**
-    4. 🛡️ **OWASP & MITRE Mapping:** Group findings.
-    5. 🔧 **Remediation Steps:** Specific, actionable fixes."""
+    1. 🎯 **Executive Summary:** (Risk score out of 100, highlight OSINT/Leaks immediately).
+    2. ☣️ **OSINT & Leaks (CRITICAL):** Detail any GitHub code leaks or exposed Cloud buckets first. These are the highest priority.
+    3. 🗺️ **Attack Surface Map:** Web assets, CDN protection, open ports.
+    4. 🚨 **Vulnerable Endpoints:** Web misconfigurations, API exposures, Open Redirects.
+    5. 🛡️ **OWASP & MITRE Mapping:** Group findings.
+    6. 🔧 **Remediation Steps:** Specific, actionable fixes."""
     return call_gemini_with_retry(intel)
 
 # ==========================================
@@ -326,19 +379,31 @@ def stage_6_deliver(report):
     except Exception as e: print(f"[-] Failed: {e}")
 
 if __name__ == "__main__":
-    print(f"=== OMNISCIENCE ENGINE STARTED ===")
+    print(f"=== OMNISCIENCE ENGINE v2.0 STARTED ===")
+    
+    # Stage 1: Web & Subdomain Recon
     assets = stage_1_recon(TARGET)
+    
+    # Stage 1.5: Passive OSINT (GitHub Leaks + Cloud Assets)
+    osint_data = stage_1_5_osint(TARGET)
+    
+    # Stage 2: Web Security Audit
     assets = stage_2_web_audit(assets)
+    
+    # Stage 3: Network Origin Port Scan
     full_data = stage_3_network_scan(assets)
     
     with open('./cache/raw_data.json', 'w') as f:
-        json.dump({"target": TARGET, "assets": full_data}, f, indent=2)
+        json.dump({"target": TARGET, "assets": full_data, "osint": osint_data}, f, indent=2)
     
-    intel = stage_4_ai_analysis(full_data)
+    # Stage 4: AI Analysis (Now includes OSINT data!)
+    intel = stage_4_ai_analysis(full_data, osint_data)
     with open('./cache/processed_intel.json', 'w') as f: f.write(intel)
         
+    # Stage 5: AI Report
     report = stage_5_ai_report(intel)
     with open('./cache/final_report.md', 'w') as f: f.write(report)
         
+    # Stage 6: Delivery
     stage_6_deliver(report)
     print(f"=== OMNISCIENCE ENGINE COMPLETE ===")

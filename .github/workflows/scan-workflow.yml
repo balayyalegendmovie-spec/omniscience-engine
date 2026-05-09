@@ -12,6 +12,10 @@ on:
       callback_url:
         description: 'Cloudflare/GAS Webhook URL'
         required: true
+      false_positives:
+        description: 'Comma-separated list of FP patterns'
+        required: false
+        default: ""
 
 jobs:
   scan-and-analyze:
@@ -37,6 +41,7 @@ jobs:
           TARGET: ${{ github.event.inputs.target }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
           CALLBACK_URL: ${{ github.event.inputs.callback_url }}
+          FALSE_PATTERNS: ${{ github.event.inputs.false_positives }}
           GEMINI_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
